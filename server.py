@@ -503,9 +503,10 @@ class MasterDnsVPNServer:
             self.logger.warning(f"Invalid or missing SET_MTU_REQ data from {addr}")
             return None
 
-        # Unpack the 8 bytes (4 bytes UP, 4 bytes DOWN)
+        # Unpack the 8 bytes (4 bytes UP, 4 bytes DOWN) and the rest is the sync token
         upload_mtu = int.from_bytes(extracted_data[0:4], byteorder="big")
         download_mtu = int.from_bytes(extracted_data[4:8], byteorder="big")
+        sync_token = extracted_data[8:] if len(extracted_data) > 8 else b"OK"
 
         # Save to session map
         self.sessions[session_id]["upload_mtu"] = upload_mtu
@@ -516,8 +517,8 @@ class MasterDnsVPNServer:
             f"Session {session_id} MTU synced - UP: {upload_mtu}B, DOWN: {download_mtu}B"
         )
 
-        # Prepare response (Acknowledge)
-        response_data = b"OK"
+        # Prepare response (Return the exact token received from the client)
+        response_data = sync_token
         data_bytes = self.dns_parser.codec_transform(response_data, encrypt=True)
 
         response_packet = await self.dns_parser.generate_vpn_response_packet(

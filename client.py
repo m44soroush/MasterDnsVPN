@@ -514,9 +514,15 @@ class MasterDnsVPNClient:
         resolver = selected_conn.get("resolver")
 
         # Pack MTUs into 8 bytes (4 bytes UP, 4 bytes DOWN)
-        data_bytes = self.synced_upload_mtu.to_bytes(
-            4, byteorder="big"
-        ) + self.synced_download_mtu.to_bytes(4, byteorder="big")
+        # Generate a random sync token
+        sync_token = (generate_random_hex_text(8) + str(int(time.time()))).encode()
+
+        # Pack MTUs into 8 bytes (4 bytes UP, 4 bytes DOWN) + Sync Token
+        data_bytes = (
+            self.synced_upload_mtu.to_bytes(4, byteorder="big")
+            + self.synced_download_mtu.to_bytes(4, byteorder="big")
+            + sync_token
+        )
 
         # Encrypt the payload before sending
         encrypted_data = self.dns_packet_parser.codec_transform(
@@ -558,10 +564,16 @@ class MasterDnsVPNClient:
                 packet_type = parsed_header["packet_type"] if parsed_header else None
 
                 if packet_type == Packet_Type.SET_MTU_RES:
-                    self.logger.success(
-                        "<g>MTU values successfully synced with the server!</g>"
-                    )
-                    return True
+                    # Validate the returned token
+                    if returned_data == sync_token:
+                        self.logger.success(
+                            "<g>MTU values successfully synced with the server!</g>"
+                        )
+                        return True
+                    else:
+                        self.logger.warning(
+                            "MTU Sync token mismatch! Ignoring response."
+                        )
 
             if attempt < max_retries - 1:
                 # delay = min(base_delay * (1.5**attempt), 8.0)
