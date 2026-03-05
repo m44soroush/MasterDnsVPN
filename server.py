@@ -145,7 +145,6 @@ class MasterDnsVPNServer:
                 self.logger.debug(f"Error closing session {session_id}: {e}")
                 continue
 
-            del self.sessions[session_id]
             self.logger.info(f"Closed inactive session with ID: {session_id}")
 
     async def _handle_session_init(
