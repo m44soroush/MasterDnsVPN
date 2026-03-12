@@ -125,10 +125,11 @@ class MasterDnsVPNClient(PacketQueueMixin):
         # ---------------------------------------------------------
         # ARQ and flow-control configuration
         # ---------------------------------------------------------
-        self.arq_window_size = self.config.get("ARQ_WINDOW_SIZE", 3000)
+        self.arq_window_size = self.config.get("ARQ_WINDOW_SIZE", 500)
         self.arq_initial_rto = self.config.get("ARQ_INITIAL_RTO", 0.2)
         self.arq_max_rto = self.config.get("ARQ_MAX_RTO", 1.5)
-        self.rx_semaphore = asyncio.Semaphore(200)
+        self.rx_semaphore_limit = int(self.config.get("RX_SEMAPHORE_LIMIT", 1000))
+        self.rx_semaphore = asyncio.Semaphore(max(1, self.rx_semaphore_limit))
 
         # ---------------------------------------------------------
         # Crypto and payload encoding configuration
@@ -169,6 +170,9 @@ class MasterDnsVPNClient(PacketQueueMixin):
         self.count_ping = 0
 
         self.server_rtt_tracker = {}
+        self.max_closed_stream_records = int(
+            self.config.get("MAX_CLOSED_STREAM_RECORDS", 2000)
+        )
 
         # ---------------------------------------------------------
         # Resolver balancing and protocol helpers
@@ -753,9 +757,9 @@ class MasterDnsVPNClient(PacketQueueMixin):
             )
             has_info = True
 
-        if self.arq_window_size < 3000:
+        if self.arq_window_size < 500:
             self.logger.warning(
-                f"<yellow>🔸 [Throughput]: <cyan>ARQ_WINDOW_SIZE</cyan> is <red>{self.arq_window_size}</red>. Increase to <green>3000</green>+ for high speeds.</yellow>"
+                f"<yellow>🔸 [Throughput]: <cyan>ARQ_WINDOW_SIZE</cyan> is <red>{self.arq_window_size}</red>. Increase to <green>500</green>+ for high speeds.</yellow>"
             )
             has_warnings = True
 
@@ -1519,11 +1523,9 @@ class MasterDnsVPNClient(PacketQueueMixin):
                 )
 
             if self.protocol_type == "SOCKS5":
-                if self.config.get("AUTH_USERNAME") and self.config.get(
-                    "AUTH_PASSWORD"
-                ):
+                if self.config.get("SOCKS5_USER") and self.config.get("SOCKS5_PASS"):
                     self.logger.info(
-                        f"<green>SOCKS5 Proxy started on {listen_port} with Authentication. Username: <cyan>{self.config.get('AUTH_USERNAME')}</cyan></green>"
+                        f"<green>SOCKS5 Proxy started on {listen_port} with Authentication. Username: <cyan>{self.config.get('SOCKS5_USER')}</cyan></green>"
                     )
                 else:
                     self.logger.info(
@@ -2494,7 +2496,7 @@ class MasterDnsVPNClient(PacketQueueMixin):
         stream_data["status"] = "CLOSING"
         self.closed_streams[stream_id] = time.monotonic()
 
-        if len(self.closed_streams) > 1000:
+        if len(self.closed_streams) > self.max_closed_stream_records:
             self.closed_streams.pop(next(iter(self.closed_streams)))
 
         self.logger.debug(

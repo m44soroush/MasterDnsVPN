@@ -135,7 +135,7 @@ class MasterDnsVPNServer(PacketQueueMixin):
         # Session pools and server runtime state
         # ---------------------------------------------------------
         self.sessions = {}
-        self._max_sessions = 255
+        self._max_sessions = max(1, min(255, int(self.config.get("MAX_SESSIONS", 255))))
         self.free_session_ids = deque(range(1, self._max_sessions + 1))
         self.recently_closed_sessions = {}
 
@@ -271,7 +271,7 @@ class MasterDnsVPNServer(PacketQueueMixin):
     ) -> Optional[int]:
         try:
             if not self.free_session_ids:
-                self.logger.error("All 255 session slots are full!")
+                self.logger.error(f"All {self._max_sessions} session slots are full!")
                 return None
 
             session_id = self.free_session_ids.popleft()
