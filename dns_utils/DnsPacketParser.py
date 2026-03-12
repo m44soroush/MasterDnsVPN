@@ -19,47 +19,129 @@ class DnsPacketParser:
     Handles DNS packet parsing, construction, and custom VPN header encoding.
     """
 
+    # Header extension rules:
+    # - _PT_STREAM_EXT: packet carries stream_id
+    # - _PT_SEQ_EXT: packet carries sequence_num (ARQ/control unification)
+    # - _PT_FRAG_EXT: packet carries fragment_id
+
     _PT_STREAM_EXT = frozenset(
         {
+            # Stream lifecycle and data
             Packet_Type.STREAM_SYN,
             Packet_Type.STREAM_SYN_ACK,
+            Packet_Type.STREAM_DATA,
+            Packet_Type.STREAM_DATA_ACK,
+            Packet_Type.STREAM_RESEND,
+            # Stream closure/reset
             Packet_Type.STREAM_FIN,
             Packet_Type.STREAM_FIN_ACK,
             Packet_Type.STREAM_RST,
             Packet_Type.STREAM_RST_ACK,
-            Packet_Type.STREAM_DATA,
-            Packet_Type.STREAM_DATA_ACK,
-            Packet_Type.STREAM_RESEND,
+            # TCP-like stream control
+            Packet_Type.STREAM_KEEPALIVE,
+            Packet_Type.STREAM_KEEPALIVE_ACK,
+            Packet_Type.STREAM_WINDOW_UPDATE,
+            Packet_Type.STREAM_WINDOW_UPDATE_ACK,
+            Packet_Type.STREAM_PROBE,
+            Packet_Type.STREAM_PROBE_ACK,
+            # MTU test packets that are stream-bound in parser format
             Packet_Type.MTU_UP_REQ,
             Packet_Type.MTU_DOWN_RES,
+            # SOCKS handshake
             Packet_Type.SOCKS5_SYN,
             Packet_Type.SOCKS5_SYN_ACK,
-        }
-    )
-    _PT_SEQ_EXT = frozenset(
-        {
-            Packet_Type.STREAM_DATA_ACK,
-            Packet_Type.STREAM_DATA,
-            Packet_Type.STREAM_RESEND,
-            Packet_Type.STREAM_FIN,
-            Packet_Type.STREAM_FIN_ACK,
-            Packet_Type.STREAM_RST,
-            Packet_Type.STREAM_RST_ACK,
-            Packet_Type.MTU_UP_REQ,
-            Packet_Type.MTU_DOWN_RES,
-            Packet_Type.SOCKS5_SYN,
-        }
-    )
-    _PT_FRAG_EXT = frozenset(
-        {
-            Packet_Type.STREAM_DATA,
-            Packet_Type.STREAM_RESEND,
-            Packet_Type.MTU_UP_REQ,
-            Packet_Type.MTU_DOWN_RES,
-            Packet_Type.SOCKS5_SYN,
+            # SOCKS result/error packets
+            Packet_Type.SOCKS5_CONNECT_FAIL,
+            Packet_Type.SOCKS5_CONNECT_FAIL_ACK,
+            Packet_Type.SOCKS5_RULESET_DENIED,
+            Packet_Type.SOCKS5_RULESET_DENIED_ACK,
+            Packet_Type.SOCKS5_NETWORK_UNREACHABLE,
+            Packet_Type.SOCKS5_NETWORK_UNREACHABLE_ACK,
+            Packet_Type.SOCKS5_HOST_UNREACHABLE,
+            Packet_Type.SOCKS5_HOST_UNREACHABLE_ACK,
+            Packet_Type.SOCKS5_CONNECTION_REFUSED,
+            Packet_Type.SOCKS5_CONNECTION_REFUSED_ACK,
+            Packet_Type.SOCKS5_TTL_EXPIRED,
+            Packet_Type.SOCKS5_TTL_EXPIRED_ACK,
+            Packet_Type.SOCKS5_COMMAND_UNSUPPORTED,
+            Packet_Type.SOCKS5_COMMAND_UNSUPPORTED_ACK,
+            Packet_Type.SOCKS5_ADDRESS_TYPE_UNSUPPORTED,
+            Packet_Type.SOCKS5_ADDRESS_TYPE_UNSUPPORTED_ACK,
+            Packet_Type.SOCKS5_AUTH_FAILED,
+            Packet_Type.SOCKS5_AUTH_FAILED_ACK,
+            Packet_Type.SOCKS5_UPSTREAM_UNAVAILABLE,
+            Packet_Type.SOCKS5_UPSTREAM_UNAVAILABLE_ACK,
         }
     )
 
+    _PT_SEQ_EXT = frozenset(
+        {
+            # Stream lifecycle and data
+            Packet_Type.STREAM_SYN,
+            Packet_Type.STREAM_SYN_ACK,
+            Packet_Type.STREAM_DATA,
+            Packet_Type.STREAM_DATA_ACK,
+            Packet_Type.STREAM_RESEND,
+            # Stream closure/reset
+            Packet_Type.STREAM_FIN,
+            Packet_Type.STREAM_FIN_ACK,
+            Packet_Type.STREAM_RST,
+            Packet_Type.STREAM_RST_ACK,
+            # TCP-like stream control
+            Packet_Type.STREAM_KEEPALIVE,
+            Packet_Type.STREAM_KEEPALIVE_ACK,
+            Packet_Type.STREAM_WINDOW_UPDATE,
+            Packet_Type.STREAM_WINDOW_UPDATE_ACK,
+            Packet_Type.STREAM_PROBE,
+            Packet_Type.STREAM_PROBE_ACK,
+            # MTU test packets that currently use seq in parser
+            Packet_Type.MTU_UP_REQ,
+            Packet_Type.MTU_DOWN_RES,
+            # SOCKS handshake/data
+            Packet_Type.SOCKS5_SYN,
+            Packet_Type.SOCKS5_SYN_ACK,
+            # SOCKS result/error packets
+            Packet_Type.SOCKS5_CONNECT_FAIL,
+            Packet_Type.SOCKS5_CONNECT_FAIL_ACK,
+            Packet_Type.SOCKS5_RULESET_DENIED,
+            Packet_Type.SOCKS5_RULESET_DENIED_ACK,
+            Packet_Type.SOCKS5_NETWORK_UNREACHABLE,
+            Packet_Type.SOCKS5_NETWORK_UNREACHABLE_ACK,
+            Packet_Type.SOCKS5_HOST_UNREACHABLE,
+            Packet_Type.SOCKS5_HOST_UNREACHABLE_ACK,
+            Packet_Type.SOCKS5_CONNECTION_REFUSED,
+            Packet_Type.SOCKS5_CONNECTION_REFUSED_ACK,
+            Packet_Type.SOCKS5_TTL_EXPIRED,
+            Packet_Type.SOCKS5_TTL_EXPIRED_ACK,
+            Packet_Type.SOCKS5_COMMAND_UNSUPPORTED,
+            Packet_Type.SOCKS5_COMMAND_UNSUPPORTED_ACK,
+            Packet_Type.SOCKS5_ADDRESS_TYPE_UNSUPPORTED,
+            Packet_Type.SOCKS5_ADDRESS_TYPE_UNSUPPORTED_ACK,
+            Packet_Type.SOCKS5_AUTH_FAILED,
+            Packet_Type.SOCKS5_AUTH_FAILED_ACK,
+            Packet_Type.SOCKS5_UPSTREAM_UNAVAILABLE,
+            Packet_Type.SOCKS5_UPSTREAM_UNAVAILABLE_ACK,
+        }
+    )
+
+    _PT_FRAG_EXT = frozenset(
+        {
+            # Data-bearing / chunked payloads only
+            Packet_Type.STREAM_DATA,
+            Packet_Type.STREAM_RESEND,
+            Packet_Type.MTU_UP_REQ,
+            Packet_Type.MTU_DOWN_RES,
+            Packet_Type.SOCKS5_SYN,
+        }
+    )
+    _PT_COMP_EXT = frozenset(
+        {
+            # Compress only data-heavy payloads to avoid CPU overhead on control/handshake packets.
+            Packet_Type.STREAM_DATA,
+            Packet_Type.STREAM_RESEND,
+            Packet_Type.PACKED_CONTROL_BLOCKS,
+        }
+    )
     _VALID_PACKET_TYPES = frozenset(
         v for k, v in Packet_Type.__dict__.items() if not k.startswith("__")
     )
@@ -67,6 +149,10 @@ class DnsPacketParser:
     _RR_PACKER = struct.Struct(">HHIH")
     _Q_PACKER = struct.Struct(">HH")
     _HEADER_PACKER = struct.Struct(">HHHHHH")
+
+    # Packed control block format: packet_type(1) + stream_id(2) + sequence_num(2) = 5 bytes
+    PACKED_CONTROL_BLOCK_STRUCT = struct.Struct(">BHH")
+    PACKED_CONTROL_BLOCK_SIZE = PACKED_CONTROL_BLOCK_STRUCT.size
 
     _VALID_QTYPES = frozenset(
         v for k, v in DNS_Record_Type.__dict__.items() if not k.startswith("__")
@@ -113,10 +199,11 @@ class DnsPacketParser:
         elif self.encryption_method == 2:
             try:
                 from cryptography.hazmat.backends import default_backend
-                from cryptography.hazmat.primitives.ciphers import Cipher
+                from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
 
                 self._Cipher = Cipher
                 self._default_backend = default_backend
+                self._chacha_algo = algorithms.ChaCha20
             except ImportError:
                 pass
 
@@ -685,6 +772,7 @@ class DnsPacketParser:
         fragment_id: int = 0,
         total_fragments: int = 0,
         total_data_length: int = 0,
+        compression_type: int = 0,
     ) -> list[bytes]:
         gen = self.generate_labels
         sq = self.simple_question_packet
@@ -701,6 +789,7 @@ class DnsPacketParser:
             fragment_id,
             total_fragments,
             total_data_length,
+            compression_type,
         )
 
         if not labels:
@@ -721,6 +810,7 @@ class DnsPacketParser:
         fragment_id: int = 0,
         total_fragments: int = 0,
         total_data_length: int = 0,
+        compression_type: int = 0,
     ) -> list:
         if encode_data and data:
             data_str = self.base_encode(data, lowerCaseOnly=True)
@@ -759,6 +849,7 @@ class DnsPacketParser:
                 fragment_id=0,
                 total_fragments=calculated_total_fragments,
                 total_data_length=raw_data_len,
+                compression_type=compression_type,
             )
 
             if data_len:
@@ -789,6 +880,7 @@ class DnsPacketParser:
                 fragment_id=frag_id,
                 total_fragments=calculated_total_fragments,
                 total_data_length=raw_data_len,
+                compression_type=compression_type,
             )
 
             if chunk_str:
@@ -924,6 +1016,7 @@ class DnsPacketParser:
         total_fragments: int = 0,
         total_data_length: int = 0,
         encode_data: bool = False,
+        compression_type: int = 0,
     ) -> bytes:
         header_b = self.create_vpn_header(
             session_id,
@@ -934,6 +1027,7 @@ class DnsPacketParser:
             fragment_id,
             total_fragments,
             total_data_length,
+            compression_type=compression_type,
             encrypt_data=False,
             base_encode=False,
         )
@@ -1104,6 +1198,8 @@ class DnsPacketParser:
         if Packet_Type.STREAM_DATA in self._PT_FRAG_EXT:
             # frag byte + the special-case extra 3 bytes when seq==0 and frag==0
             hb_len += 4
+        if Packet_Type.STREAM_DATA in self._PT_COMP_EXT:
+            hb_len += 1
 
         # include marker byte added before base-encoding
         bits = (hb_len + 1) * 8
@@ -1271,6 +1367,7 @@ class DnsPacketParser:
         PT_STREAM = self._PT_STREAM_EXT
         PT_SEQ = self._PT_SEQ_EXT
         PT_FRAG = self._PT_FRAG_EXT
+        PT_COMP = self._PT_COMP_EXT
 
         if ptype in PT_STREAM:
             if ln < off + 2:
@@ -1292,6 +1389,12 @@ class DnsPacketParser:
             header_data["total_data_length"] = (hb[off + 2] << 8) | hb[off + 3]
             off += 4
 
+        if ptype in PT_COMP:
+            if ln < off + 1:
+                return (None, 0) if return_length else None
+            header_data["compression_type"] = hb[off]
+            off += 1
+
         if return_length:
             return header_data, off - offset
         return header_data
@@ -1308,18 +1411,20 @@ class DnsPacketParser:
     #   [0]  1 byte  (uint8)  : Session ID
     #   [1]  1 byte  (uint8)  : Packet Type
     #
-    # Extended Headers for STREAM_SYN, STREAM_SYN_ACK, STREAM_FIN, STREAM_DATA, STREAM_DATA_ACK, STREAM_RESEND, MTU_UP_REQ, MTU_DOWN_RES
-    #   [2]  2 bytes (uint16) : Stream ID (for STREAM_DATA packets)
+    # Extended headers for packet types in _PT_STREAM_EXT:
+    #   [2]  2 bytes (uint16) : Stream ID
     #
-    # Extended Headers for STREAM_DATA_ACK, STREAM_DATA, STREAM_RESEND, MTU_UP_REQ, MTU_DOWN_RES
-    #   [3]  2 bytes (uint16) : Sequence Number (for STREAM_DATA packets)
+    # Extended headers for packet types in _PT_SEQ_EXT:
+    #   [3]  2 bytes (uint16) : Sequence Number
     #
-    # Extended Headers for STREAM_DATA, STREAM_RESEND, MTU_UP_REQ, MTU_DOWN_RES
-    #   [4]  1 byte  (uint8)  : Fragment ID (for STREAM_DATA packets)
-    # Extended Header for STREAM_DATA or MTU_UP_REQ or MTU_DOWN_RES, If sequence number = 0 and fragment ID = 0
+    # Extended headers for packet types in _PT_FRAG_EXT:
+    #   [4]  1 byte  (uint8)  : Fragment ID
+    # Extended header for first fragment only (commonly when sequence=0 and frag=0):
     #   [5]  1 byte  (uint8)  : Total Fragments (for first packet of a stream)
     #   [6]  2 bytes (uint16) : Total Data Length (for first packet of a stream)
     #
+    # Extended header for packet types in _PT_COMP_EXT:
+    #   [+1] 1 byte  (uint8)  : Compression Type (0=OFF, non-zero=algorithm id)
     def create_vpn_header(
         self,
         session_id: int,
@@ -1330,6 +1435,7 @@ class DnsPacketParser:
         fragment_id: int = 0,
         total_fragments: int = 0,
         total_data_length: int = 0,
+        compression_type: int = 0,
         encrypt_data: bool = True,
         base_encode: bool = True,
     ) -> str:
@@ -1340,11 +1446,12 @@ class DnsPacketParser:
             session_id (int): VPN session identifier (0-255).
             packet_type (int): Type of VPN packet (0-255).
             base36_encode (bool): Whether to base36 encode the header,
-            stream_id (int): Stream ID for STREAM_DATA packets (0-65535).
-            sequence_num (int): Sequence number for STREAM_DATA packets (0-65535).
-            fragment_id (int): Fragment ID for STREAM_DATA packets (0-255).
-            total_fragments (int): Total fragments for the stream (0-255).
-            total_data_length (int): Total data length for the stream (0-65535).
+            stream_id (int): Stream ID for packets in _PT_STREAM_EXT (0-65535).
+            sequence_num (int): Sequence number for packets in _PT_SEQ_EXT (0-65535).
+            fragment_id (int): Fragment ID for packets in _PT_FRAG_EXT (0-255).
+            total_fragments (int): Total fragments for packets in _PT_FRAG_EXT (0-255).
+            total_data_length (int): Total payload length for packets in _PT_FRAG_EXT (0-65535).
+            compression_type (int): Compression type byte for packet types in _PT_COMP_EXT.
             encrypt_data (bool): Whether to encrypt the header.
             base_encode (bool): Whether to base36 encode the header.
         Returns:
@@ -1370,6 +1477,9 @@ class DnsPacketParser:
                     total_data_length & 0xFF,
                 ]
             )
+
+        if packet_type in self._PT_COMP_EXT:
+            h_list.append(compression_type & 0xFF)
 
         raw_header = bytes(h_list)
 

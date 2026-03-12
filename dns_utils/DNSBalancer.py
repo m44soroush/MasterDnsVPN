@@ -48,6 +48,30 @@ class DNSBalancer:
         self.valid_servers_count = len(self.valid_servers)
         self.rr_index = 0
 
+    def _normalize_required_count(
+        self, required_count: int, default_if_invalid: int = 1
+    ) -> int:
+        """
+        Normalize caller-requested server count.
+        - Non-int values fallback to default_if_invalid.
+        - Values <= 0 are treated as default_if_invalid.
+        - Final count is capped by available valid servers.
+        """
+        if not self.valid_servers_count:
+            return 0
+
+        try:
+            count = int(required_count)
+        except (TypeError, ValueError):
+            count = int(default_if_invalid)
+
+        if count <= 0:
+            count = int(default_if_invalid)
+
+        if count > self.valid_servers_count:
+            return self.valid_servers_count
+        return count
+
     def report_success(self, server_key: str, rtt: float = 0.0):
         stats = self.server_stats[server_key]
         stats["acked"] += 1
@@ -90,11 +114,7 @@ class DNSBalancer:
         return servers[0] if servers else None
 
     def get_unique_servers(self, required_count: int) -> list:
-        actual_count = (
-            required_count
-            if required_count < self.valid_servers_count
-            else self.valid_servers_count
-        )
+        actual_count = self._normalize_required_count(required_count)
         if not actual_count:
             return []
 
@@ -137,11 +157,7 @@ class DNSBalancer:
             )
 
     def get_servers_for_stream(self, stream_id: int, required_count: int) -> list:
-        actual_count = (
-            required_count
-            if required_count < self.valid_servers_count
-            else self.valid_servers_count
-        )
+        actual_count = self._normalize_required_count(required_count)
         if not actual_count:
             return []
 

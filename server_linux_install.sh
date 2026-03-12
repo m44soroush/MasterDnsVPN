@@ -1,6 +1,8 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# --- Colors & Styles ---
+set -euo pipefail
+IFS=$'\n\t'
+
 RED='\033[1;31m'
 GREEN='\033[1;32m'
 YELLOW='\033[1;33m'
@@ -8,31 +10,46 @@ BLUE='\033[1;34m'
 MAGENTA='\033[1;35m'
 CYAN='\033[1;36m'
 BOLD='\033[1m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# --- Helper Functions ---
 log_header() { echo -e "\n${CYAN}${BOLD}>>> $1${NC}"; }
 log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
 log_success() { echo -e "${GREEN}[DONE]${NC} $1"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
+require_cmd() { command -v "$1" >/dev/null 2>&1 || log_error "Missing command: $1"; }
+backup_file_once() {
+  local f="$1"
+  [[ -f "$f" && ! -f "${f}.bak" ]] && cp -a "$f" "${f}.bak"
+}
+extract_config_version() {
+  local f="$1"
+  [[ -f "$f" ]] || return 0
+  grep '^CONFIG_VERSION' "$f" | awk -F'=' '{print $2}' | tr -d ' "' | head -n1
+}
+version_lt() {
+  [[ "$1" == "$2" ]] && return 1
+  [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" == "$1" ]]
+}
 
-# Root check
-if [ "$EUID" -ne 0 ]; then
-  log_error "Please run this script as root (sudo)."
+if [[ "${EUID}" -ne 0 ]]; then
+  log_error "Run this script as root (sudo)."
 fi
 
-# Set working directory
-INSTALL_DIR="$(pwd)"
+INSTALL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$INSTALL_DIR"
 
-# Check for config file conflicts
-if [ -f "server_config.toml" ] && [ -f "server_config.toml.backup" ]; then
-    log_error "Both 'server_config.toml' and 'server_config.toml.backup' exist! Please delete or move one of them to avoid conflicts, then run the script again."
+if [[ -f "server_config.toml" && -f "server_config.toml.backup" ]]; then
+  log_error "Both server_config.toml and server_config.toml.backup exist. Remove one and retry."
 fi
 
-# --- Welcome Banner ---
-clear
+if [[ -f /etc/os-release ]]; then
+  # shellcheck disable=SC1091
+  . /etc/os-release
+else
+  log_error "OS detection failed (/etc/os-release missing)."
+fi
+
 echo -e "${MAGENTA}${BOLD}"
 echo "  __  __           _             _____  _   _  _____ "
 echo " |  \/  |         | |           |  __ \| \ | |/ ____|"
@@ -43,229 +60,306 @@ echo " |_|  |_|\__,_|___/\__\___|_|   |_____/|_| \_|_____/ "
 echo -e "           MasterDnsVPN Server Auto-Installer${NC}"
 echo -e "${CYAN}------------------------------------------------------${NC}"
 
-# 1. Environment Prep
+TMP_LOG="init_logs.tmp"
+cleanup() { rm -f "$TMP_LOG" 2>/dev/null || true; }
+trap cleanup EXIT
+
+PM=""
+if command -v apt-get >/dev/null 2>&1; then PM="apt";
+elif command -v dnf >/dev/null 2>&1; then PM="dnf";
+elif command -v yum >/dev/null 2>&1; then PM="yum";
+else log_error "No supported package manager found (apt/dnf/yum)."; fi
+
 log_header "Preparing Environment"
-log_info "Updating system and installing dependencies..."
-apt-get update -y > /dev/null 2>&1
-apt-get install -y lsof net-tools wget unzip curl ca-certificates > /dev/null 2>&1
+log_info "Installing dependencies..."
+if [[ "$PM" == "apt" ]]; then
+  apt-get update -y >/dev/null 2>&1
+  apt-get install -y lsof net-tools wget unzip curl ca-certificates iproute2 procps >/dev/null 2>&1
+elif [[ "$PM" == "dnf" ]]; then
+  dnf -y install lsof net-tools wget unzip curl ca-certificates iproute procps-ng >/dev/null 2>&1
+else
+  yum -y install lsof net-tools wget unzip curl ca-certificates iproute procps-ng >/dev/null 2>&1
+fi
+require_cmd ss
+require_cmd unzip
+require_cmd systemctl
+require_cmd sysctl
 log_success "System tools are ready."
 
-# 2. Port 53 Management
-log_header "Managing Network Ports (Port 53)"
+check_port53() {
+  ss -H -lun "sport = :53" 2>/dev/null | grep -q ':53' && return 0
+  ss -H -ltn "sport = :53" 2>/dev/null | grep -q ':53' && return 0
+  return 1
+}
 
-# Stop existing service first
-if systemctl list-unit-files | grep -q masterdnsvpn.service; then
-    log_info "Stopping existing MasterDnsVPN service..."
-    systemctl stop masterdnsvpn 2>/dev/null || true
+get_port53_pids() {
+  local pids
+  pids="$(ss -H -lupn "sport = :53" 2>/dev/null | sed -n 's/.*pid=\([0-9]\+\).*/\1/p' | sort -u)"
+  if [[ -n "$pids" ]]; then
+    echo "$pids"
+    return 0
+  fi
+  lsof -ti :53 2>/dev/null || true
+}
+
+log_header "Managing Network Ports (Port 53)"
+if systemctl list-unit-files | grep -q '^masterdnsvpn\.service'; then
+  log_info "Stopping existing MasterDnsVPN service..."
+  systemctl stop masterdnsvpn 2>/dev/null || true
 fi
 
-# check_port53() { lsof -i :53 -t > /dev/null 2>&1; }
-check_port53() { netstat -tunlp 2>/dev/null | awk '{print $4}' | grep -qE '.*:53$'; }
-
 if check_port53; then
-    log_warn "Port 53 is occupied. Cleaning up..."
-    
-    if systemctl is-active --quiet systemd-resolved; then
-        log_info "Configuring systemd-resolved..."
-        sed -i 's/#DNSStubListener=yes/DNSStubListener=no/' /etc/systemd/resolved.conf
-        sed -i 's/DNSStubListener=yes/DNSStubListener=no/' /etc/systemd/resolved.conf
-        # Ensure server has a fallback DNS to keep internet access
-        if ! grep -q "DNS=8.8.8.8" /etc/systemd/resolved.conf; then
-            echo "DNS=8.8.8.8" >> /etc/systemd/resolved.conf
-        fi
-        systemctl restart systemd-resolved
-    fi
+  log_warn "Port 53 is occupied. Trying auto-cleanup..."
 
-    for srv in bind9 named dnsmasq; do
-        if systemctl is-active --quiet $srv; then
-            log_info "Disabling conflicting service: $srv"
-            systemctl stop $srv && systemctl disable $srv > /dev/null 2>&1
-        fi
-    done
-
-    if check_port53; then
-        # OCC_INFO=$(lsof -i :53 -n -P | grep -E "LISTEN|UDP" | awk 'NR==1 {print $1 " (PID: " $2 ")"}')
-        OCC_INFO=$(netstat -tunlp 2>/dev/null | grep -E '.*:53\s+' | head -n 1 | awk '{split($NF,a,"/"); print a[2] " (PID: " a[1] ")"}')
-        log_error "Port 53 is still held by: ${BOLD}${RED}${OCC_INFO:-Unknown}${NC}\n       Kill it manually and restart."
+  if systemctl is-active --quiet systemd-resolved; then
+    log_info "Configuring systemd-resolved DNSStubListener=no ..."
+    backup_file_once /etc/systemd/resolved.conf
+    if grep -q '^#\?DNSStubListener=' /etc/systemd/resolved.conf; then
+      sed -i 's/^#\?DNSStubListener=.*/DNSStubListener=no/' /etc/systemd/resolved.conf || true
+    else
+      echo 'DNSStubListener=no' >> /etc/systemd/resolved.conf
     fi
+    if ! grep -q '^DNS=' /etc/systemd/resolved.conf; then
+      echo 'DNS=8.8.8.8' >> /etc/systemd/resolved.conf
+    fi
+    systemctl restart systemd-resolved || true
+  fi
+
+  for srv in bind9 named named-pkcs11 dnsmasq unbound pdns knot-resolver; do
+    if systemctl is-active --quiet "$srv"; then
+      log_info "Disabling conflicting service: $srv"
+      systemctl stop "$srv" || true
+      systemctl disable "$srv" >/dev/null 2>&1 || true
+    fi
+  done
+
+  PIDS_ON_53="$(get_port53_pids)"
+  if [[ -n "${PIDS_ON_53:-}" ]]; then
+    while IFS= read -r pid; do
+      [[ -z "$pid" ]] && continue
+      cmdline="$(ps -p "$pid" -o cmd= 2>/dev/null || true)"
+      if echo "$cmdline" | grep -qiE 'masterdnsvpn|masterdnsvpn_server'; then
+        log_info "Stopping leftover MasterDnsVPN process on :53 (PID: $pid)"
+        kill "$pid" 2>/dev/null || true
+        sleep 1
+        kill -9 "$pid" 2>/dev/null || true
+      fi
+    done <<< "$PIDS_ON_53"
+  fi
+
+  if check_port53; then
+    OCC_INFO="$(ss -H -lupn 'sport = :53' 2>/dev/null | head -n1 | awk '{print $NF}' || true)"
+    log_error "Port 53 is still occupied: ${OCC_INFO:-unknown}. Stop it manually and retry."
+  fi
 fi
 log_success "Port 53 is available."
 
-# 3. Firewall Configuration
-log_header "Configuring Firewall (Port 53 UDP)"
-
-# Check for UFW (Common on Ubuntu/Debian)
+log_header "Configuring Firewall (Port 53 UDP/TCP)"
 if command -v ufw >/dev/null 2>&1 && ufw status | grep -qw active; then
-    log_info "UFW detected and active. Opening port 53/udp..."
-    ufw allow 53/udp >/dev/null 2>&1
-    log_success "Port 53 opened via UFW."
-
-# Check for Firewalld (Common on CentOS/RHEL/Alma/Rocky)
+  ufw allow 53/udp >/dev/null 2>&1 || true
+  ufw allow 53/tcp >/dev/null 2>&1 || true
+  log_success "Port 53 (UDP/TCP) opened via UFW."
 elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
-    log_info "Firewalld detected and active. Opening port 53/udp..."
-    firewall-cmd --permanent --add-port=53/udp >/dev/null 2>&1
-    firewall-cmd --reload >/dev/null 2>&1
-    log_success "Port 53 opened via Firewalld."
-
-# Check for generic iptables as a fallback
+  firewall-cmd --permanent --add-port=53/udp >/dev/null 2>&1 || true
+  firewall-cmd --permanent --add-port=53/tcp >/dev/null 2>&1 || true
+  firewall-cmd --reload >/dev/null 2>&1 || true
+  log_success "Port 53 (UDP/TCP) opened via firewalld."
 elif command -v iptables >/dev/null 2>&1; then
-    log_info "Checking iptables rules..."
-    # Check if the rule already exists to avoid duplicates
-    if ! iptables -C INPUT -p udp --dport 53 -j ACCEPT 2>/dev/null; then
-        log_info "Adding iptables rule for port 53/udp..."
-        iptables -I INPUT -p udp --dport 53 -j ACCEPT
-        
-        # Try to save the rules so they persist across reboots
-        if command -v netfilter-persistent >/dev/null 2>&1; then
-            netfilter-persistent save >/dev/null 2>&1
-        elif command -v iptables-save >/dev/null 2>&1 && [ -d /etc/iptables ]; then
-            iptables-save > /etc/iptables/rules.v4
-        fi
-        log_success "Port 53 opened via iptables."
-    else
-        log_success "iptables rule for Port 53 already exists."
-    fi
+  iptables -C INPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport 53 -j ACCEPT
+  iptables -C INPUT -p tcp --dport 53 -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport 53 -j ACCEPT
+  if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -C INPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p udp --dport 53 -j ACCEPT
+    ip6tables -C INPUT -p tcp --dport 53 -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p tcp --dport 53 -j ACCEPT
+  fi
+  if command -v netfilter-persistent >/dev/null 2>&1; then
+    netfilter-persistent save >/dev/null 2>&1 || true
+  elif command -v iptables-save >/dev/null 2>&1 && [[ -d /etc/iptables ]]; then
+    iptables-save > /etc/iptables/rules.v4
+    command -v ip6tables-save >/dev/null 2>&1 && ip6tables-save > /etc/iptables/rules.v6
+  fi
+  log_success "Port 53 (UDP/TCP) rule is ready via iptables."
 else
-    log_warn "No recognized firewall (UFW/Firewalld/iptables) found or active. Skipping..."
+  log_warn "No supported firewall tool detected. Skipping firewall setup."
 fi
 
+log_header "Tuning Kernel & Limits"
+cat > /etc/sysctl.d/99-masterdnsvpn.conf <<'EOF'
+# MasterDnsVPN high-load tuning
+fs.file-max = 2097152
+fs.nr_open = 2097152
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 16384
+net.core.optmem_max = 25165824
+net.core.rmem_default = 262144
+net.core.wmem_default = 262144
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+net.ipv4.udp_rmem_min = 16384
+net.ipv4.udp_wmem_min = 16384
+net.ipv4.udp_mem = 65536 131072 262144
+net.ipv4.ip_local_port_range = 10240 65535
+EOF
+sysctl --system >/dev/null 2>&1 || log_warn "Could not fully apply sysctl settings."
 
-# 4. Detection & Download
+cat > /etc/security/limits.d/99-masterdnsvpn.conf <<'EOF'
+* soft nofile 1048576
+* hard nofile 1048576
+root soft nofile 1048576
+root hard nofile 1048576
+EOF
+log_success "Kernel and file descriptor limits configured."
+
 log_header "Fetching Latest Release"
-ARCH=$(uname -m)
-[ -f /etc/os-release ] && . /etc/os-release || log_error "OS detection failed."
-
-if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
-    URL="https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Server_Linux_ARM64.zip"
-    PREFIX="MasterDnsVPN_Server_Linux_ARM64"
-elif [ "$ARCH" = "x86_64" ]; then
-    LEGACY=0
-    [[ "$ID" == "ubuntu" && ${VERSION_ID%%.*} -le 20 ]] && LEGACY=1
-    [[ "$ID" == "debian" && ${VERSION_ID%%.*} -le 11 ]] && LEGACY=1
-
-    if [ $LEGACY -eq 1 ]; then
-        log_info "Legacy system detected (GLIBC compatibility mode)."
-        URL="https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Server_Linux-Legacy_AMD64.zip"
-        PREFIX="MasterDnsVPN_Server_Linux-Legacy_AMD64"
-    else
-        URL="https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Server_Linux_AMD64.zip"
-        PREFIX="MasterDnsVPN_Server_Linux_AMD64"
-    fi
+ARCH="$(uname -m)"
+if [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]]; then
+  URL="https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Server_Linux_ARM64.zip"
+  PREFIX="MasterDnsVPN_Server_Linux_ARM64"
+elif [[ "$ARCH" == "x86_64" ]]; then
+  LEGACY=0
+  [[ "${ID:-}" == "ubuntu" && ${VERSION_ID%%.*} -le 20 ]] && LEGACY=1
+  [[ "${ID:-}" == "debian" && ${VERSION_ID%%.*} -le 11 ]] && LEGACY=1
+  if [[ $LEGACY -eq 1 ]]; then
+    log_info "Legacy system detected (GLIBC compatibility mode)."
+    URL="https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Server_Linux-Legacy_AMD64.zip"
+    PREFIX="MasterDnsVPN_Server_Linux-Legacy_AMD64"
+  else
+    URL="https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Server_Linux_AMD64.zip"
+    PREFIX="MasterDnsVPN_Server_Linux_AMD64"
+  fi
 else
-    log_error "Unsupported architecture: $ARCH"
+  log_error "Unsupported architecture: $ARCH"
 fi
 
-[ -f "server_config.toml" ] && mv server_config.toml server_config.toml.backup && log_info "Existing config backed up."
+if [[ -f "server_config.toml" ]]; then
+  mv -f server_config.toml server_config.toml.backup
+  log_info "Existing config backed up."
+fi
 
 log_info "Downloading server binaries..."
-wget -qO "server.zip" "$URL" || log_error "Download failed."
-unzip -q -o "server.zip" && rm -f "server.zip"
+rm -f server.zip
+curl -fsSL -o server.zip "$URL" || wget -qO server.zip "$URL" || log_error "Download failed."
+unzip -q -o server.zip
+rm -f server.zip
 log_success "Files extracted."
 
-EXECUTABLE=$(ls -t ${PREFIX}_v* 2>/dev/null | head -n 1)
-[ -z "$EXECUTABLE" ] && log_error "Binary not found in the package."
+EXECUTABLE="$(ls -t ${PREFIX}_v* 2>/dev/null | head -n1 || true)"
+[[ -z "$EXECUTABLE" ]] && log_error "Binary not found in package."
 chmod +x "$EXECUTABLE"
+shopt -s nullglob
+for old_bin in ${PREFIX}_v*; do
+  [[ "$old_bin" == "$EXECUTABLE" ]] && continue
+  rm -f -- "$old_bin"
+done
+shopt -u nullglob
 
-# 5. Configuration
 log_header "Configuration"
+[[ -f "server_config.toml" ]] || log_error "server_config.toml not found after extraction."
+CURRENT_VERSION="$(extract_config_version server_config.toml)"
+if [[ -z "${CURRENT_VERSION:-}" ]]; then
+  log_error "Downloaded server_config.toml is invalid (CONFIG_VERSION missing)."
+fi
+if [[ -f "server_config.toml.backup" ]]; then
+  BACKUP_VERSION="$(extract_config_version server_config.toml.backup)"
+  if [[ -z "${BACKUP_VERSION:-}" ]]; then
+    log_error "Backup config is too old (CONFIG_VERSION missing). Merge manually."
+  fi
 
-if [ -f "server_config.toml.backup" ]; then
-    # Check if CONFIG_VERSION exists in the backup
-    if ! grep -q "^CONFIG_VERSION" server_config.toml.backup; then
-        log_error "Old configuration file detected (CONFIG_VERSION is missing). Please manually move your important settings from 'server_config.toml.backup' to 'server_config.toml' and run the script again."
-    else
-        # Extract the version from the backup file
-        BACKUP_VERSION=$(grep "^CONFIG_VERSION" server_config.toml.backup | awk -F'=' '{print $2}' | tr -d ' "')
-        
-        # Extract the version from the newly downloaded file (default to 1.0 if not found)
-        CURRENT_VERSION=$(grep "^CONFIG_VERSION" server_config.toml | awk -F'=' '{print $2}' | tr -d ' "')
-        [ -z "$CURRENT_VERSION" ] && CURRENT_VERSION="1.0"
-
-        # Compare versions
-        if [ "$BACKUP_VERSION" != "$CURRENT_VERSION" ]; then
-            log_error "Config version mismatch! (Backup: $BACKUP_VERSION, New: $CURRENT_VERSION). Please manually move your important settings from 'server_config.toml.backup' to 'server_config.toml' and run the script again."
-        else
-            mv -f server_config.toml.backup server_config.toml
-            log_info "Config restored from backup."
-        fi
-    fi
+  if [[ "$BACKUP_VERSION" == "$CURRENT_VERSION" ]]; then
+    mv -f server_config.toml.backup server_config.toml
+    log_info "Config restored from backup."
+  elif version_lt "$BACKUP_VERSION" "$CURRENT_VERSION"; then
+    OLD_CFG_NAME="server_config_$(date +%Y%m%d_%H%M%S).toml"
+    mv -f server_config.toml.backup "$OLD_CFG_NAME"
+    log_warn "Old config version detected (backup=$BACKUP_VERSION < new=$CURRENT_VERSION)."
+    log_warn "Previous config renamed to: $OLD_CFG_NAME"
+    log_info "Using fresh config template; please set DOMAIN and other required fields."
+  else
+    log_error "Backup config version is newer than package config (backup=$BACKUP_VERSION, new=$CURRENT_VERSION). Merge manually."
+  fi
 fi
 
-if [ -f "server_config.toml" ] && grep -q '"v.domain.com"' server_config.toml; then
-    echo -e "${YELLOW}${BOLD}Attention:${NC} You need to set your NS Record Domain."
-    
-    read -p ">>> Enter your Domain (e.g. vpn.example.com): " USER_DOMAIN </dev/tty
-    
-    if [ -n "$USER_DOMAIN" ]; then
-        sed -i 's/DOMAIN[[:space:]]*=[[:space:]]*\["v\.domain\.com"\]/DOMAIN = ["'"$USER_DOMAIN"'"]/' server_config.toml
-    fi
+if [[ -f "server_config.toml" ]] && grep -q '"v.domain.com"' server_config.toml; then
+  echo -e "${YELLOW}${BOLD}Attention:${NC} Set your NS domain."
+  read -r -p ">>> Enter your Domain (e.g. vpn.example.com): " USER_DOMAIN </dev/tty || true
+  if [[ -n "${USER_DOMAIN:-}" ]]; then
+    sed -i -E "s|^DOMAIN[[:space:]]*=.*$|DOMAIN = [\"${USER_DOMAIN}\"]|" server_config.toml
+  fi
 fi
 
-# 6. Initialization & Key
 log_header "Security Initialization"
-log_info "Starting server to generate encryption key..."
-./"$EXECUTABLE" > init_logs.tmp 2>&1 &
+log_info "Starting server once to generate encryption key..."
+./"$EXECUTABLE" > "$TMP_LOG" 2>&1 &
 APP_PID=$!
 READY=false
-for i in {1..7}; do # Increased to 7s for slower CPUs
-    if grep -q "Using encryption key" init_logs.tmp 2>/dev/null; then READY=true; break; fi
-    sleep 1
+for _ in {1..10}; do
+  if grep -q "Using encryption key" "$TMP_LOG" 2>/dev/null; then
+    READY=true
+    break
+  fi
+  sleep 1
 done
-kill $APP_PID 2>/dev/null || true
-wait $APP_PID 2>/dev/null || true
+kill "$APP_PID" 2>/dev/null || true
+wait "$APP_PID" 2>/dev/null || true
 
-if [ "$READY" = false ]; then
-    log_warn "Initialization log dump:"
-    tail -n 5 init_logs.tmp
-    rm -f init_logs.tmp
-    log_error "Could not verify key generation. Check if Port 53 is truly free."
+if [[ "$READY" != true ]]; then
+  log_warn "Initialization log tail:"
+  tail -n 20 "$TMP_LOG" || true
+  log_error "Could not verify key generation. Ensure Port 53 is free."
 fi
-rm -f init_logs.tmp
 
 echo -e "${GREEN}${BOLD}------------------------------------------------------"
 echo -e "  YOUR ENCRYPTION KEY: ${NC}${CYAN}$(cat encrypt_key.txt 2>/dev/null)${NC}"
 echo -e "${GREEN}${BOLD}------------------------------------------------------${NC}"
 
-# 7. Service Installation
 log_header "Installing System Service"
 SVC="/etc/systemd/system/masterdnsvpn.service"
-cat <<EOF > "$SVC"
+cat > "$SVC" <<EOF
 [Unit]
 Description=MasterDnsVPN Server
-After=network.target
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 WorkingDirectory=$INSTALL_DIR
 ExecStart=$INSTALL_DIR/$EXECUTABLE
 Restart=always
-RestartSec=5
+RestartSec=3
 User=root
+
+LimitNOFILE=1048576
+LimitNPROC=65535
+TasksMax=infinity
+TimeoutStopSec=15
+KillMode=control-group
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable masterdnsvpn
-systemctl start masterdnsvpn
-log_success "MasterDnsVPN service is now running."
+systemctl enable masterdnsvpn >/dev/null 2>&1
+systemctl restart masterdnsvpn
 
-# 8. Final Instructions
+if ! systemctl is-active --quiet masterdnsvpn; then
+  journalctl -u masterdnsvpn -n 50 --no-pager || true
+  log_error "Service failed to start. See logs above."
+fi
+
+log_success "MasterDnsVPN service is running."
+
 echo -e "\n${CYAN}======================================================${NC}"
 echo -e " ${GREEN}${BOLD}       INSTALLATION COMPLETED SUCCESSFULLY!${NC}"
 echo -e "${CYAN}======================================================${NC}"
-echo -e "${BOLD}Commands to manage your server:${NC}"
-echo -e "  ${YELLOW}▶${NC} ${BOLD}Start:${NC}   systemctl start masterdnsvpn"
-echo -e "  ${YELLOW}▶${NC} ${BOLD}Stop:${NC}    systemctl stop masterdnsvpn"
-echo -e "  ${YELLOW}▶${NC} ${BOLD}Restart:${NC} systemctl restart masterdnsvpn"
-echo -e "  ${YELLOW}▶${NC} ${BOLD}Logs:${NC}    journalctl -u masterdnsvpn -f"
-echo -e "\n${BOLD}Files Location:${NC}"
-echo -e "  ${YELLOW}📂${NC} ${INSTALL_DIR}/server_config.toml"
-echo -e "  ${YELLOW}📂${NC} ${INSTALL_DIR}/encrypt_key.txt"
-echo -e "${CYAN}------------------------------------------------------${NC}"
-echo -e "${YELLOW}Final Note:${NC} If you change the config, run 'systemctl restart masterdnsvpn'"
-echo -e "${CYAN}======================================================${NC}\n"
+echo -e "${BOLD}Commands:${NC}"
+echo -e "  ${YELLOW}>${NC} Start:   systemctl start masterdnsvpn"
+echo -e "  ${YELLOW}>${NC} Stop:    systemctl stop masterdnsvpn"
+echo -e "  ${YELLOW}>${NC} Restart: systemctl restart masterdnsvpn"
+echo -e "  ${YELLOW}>${NC} Logs:    journalctl -u masterdnsvpn -f"
+echo -e "\n${BOLD}Files:${NC}"
+echo -e "  ${YELLOW}>${NC} ${INSTALL_DIR}/server_config.toml"
+echo -e "  ${YELLOW}>${NC} ${INSTALL_DIR}/encrypt_key.txt"
+echo -e "${YELLOW}Final Note:${NC} If config changes, run: systemctl restart masterdnsvpn"
 
-# Cleanup artifacts
-rm -f *.spec > /dev/null 2>&1
+rm -f *.spec >/dev/null 2>&1 || true

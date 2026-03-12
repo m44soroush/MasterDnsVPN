@@ -1,4 +1,4 @@
-# MasterDnsVPN Client
+﻿# MasterDnsVPN Client
 # Author: MasterkinG32
 # Github: https://github.com/masterking32
 # Year: 2026
@@ -10,7 +10,6 @@ import os
 import random
 import signal
 import socket
-import struct
 import sys
 import time
 from typing import Optional, Tuple
@@ -18,11 +17,20 @@ from typing import Optional, Tuple
 from dns_utils import ARQ, DNSBalancer, DnsPacketParser, PingManager, PrependReader
 from dns_utils.config_loader import get_config_path, load_config
 from dns_utils.DNS_ENUMS import DNS_Record_Type, Packet_Type
+from dns_utils.PacketQueueMixin import PacketQueueMixin
 from dns_utils.utils import (
     async_recvfrom,
     async_sendto,
     generate_random_hex_text,
     getLogger,
+)
+
+from dns_utils.compression import (
+    Compression_Type,
+    normalize_compression_type,
+    get_compression_name,
+    compress_payload,
+    try_decompress_payload,
 )
 
 # Ensure UTF-8 output for consistent logging
@@ -33,13 +41,21 @@ except Exception:
     pass
 
 
-class MasterDnsVPNClient:
+class MasterDnsVPNClient(PacketQueueMixin):
     """MasterDnsVPN Client class to handle DNS requests over UDP."""
 
     def __init__(self) -> None:
+        # ---------------------------------------------------------
+        # Runtime and lifecycle primitives
+        # ---------------------------------------------------------
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.should_stop: asyncio.Event = asyncio.Event()
         self.session_restart_event = None
+        self.rx_tasks = set()
+
+        # ---------------------------------------------------------
+        # Config and logger bootstrap
+        # ---------------------------------------------------------
         self.config: dict = load_config("client_config.toml")
         if not os.path.isfile(get_config_path("client_config.toml")):
             self.logger = getLogger(log_level=self.config.get("LOG_LEVEL", "DEBUG"))
@@ -53,25 +69,17 @@ class MasterDnsVPNClient:
             sys.exit(1)
 
         self.logger = getLogger(log_level=self.config.get("LOG_LEVEL", "INFO"))
-        self.resolvers: list = self.config.get("RESOLVER_DNS_SERVERS", [])
-        self.domains: list = self.config.get("DOMAINS", [])
-        self.timeout: float = self.config.get("DNS_QUERY_TIMEOUT", 5.0)
-        self.max_upload_mtu: int = self.config.get("MAX_UPLOAD_MTU", 512)
-        self.max_download_mtu: int = self.config.get("MAX_DOWNLOAD_MTU", 1200)
-        self.min_upload_mtu: int = self.config.get("MIN_UPLOAD_MTU", 0)
-        self.min_download_mtu: int = self.config.get("MIN_DOWNLOAD_MTU", 0)
 
-        self.base_encode_responses: bool = self.config.get("BASE_ENCODE_DATA", False)
-
-        self.mtu_test_retries: int = self.config.get("MTU_TEST_RETRIES", 2)
-        self.mtu_test_timeout: float = float(self.config.get("MTU_TEST_TIMEOUT", 1.0))
-
-        self.encryption_method: int = self.config.get("DATA_ENCRYPTION_METHOD", 1)
-
+        # ---------------------------------------------------------
+        # Protocol and authentication configuration
+        # ---------------------------------------------------------
         self.protocol_type: str = self.config.get("PROTOCOL_TYPE", "SOCKS5").upper()
         self.socks5_auth: bool = self.config.get("SOCKS5_AUTH", False)
         self.socks5_user: str = str(self.config.get("SOCKS5_USER", ""))
         self.socks5_pass: str = str(self.config.get("SOCKS5_PASS", ""))
+        self.socks_handshake_timeout: float = float(
+            self.config.get("SOCKS_HANDSHAKE_TIMEOUT", 240.0)
+        )
 
         if self.protocol_type not in ("SOCKS5", "TCP"):
             self.logger.error(
@@ -80,19 +88,71 @@ class MasterDnsVPNClient:
             input("Press Enter to exit...")
             sys.exit(1)
 
-        self.crypto_overhead = 0
-        if self.encryption_method == 2:
-            self.crypto_overhead = 16
-        elif self.encryption_method in (3, 4, 5):
-            self.crypto_overhead = 28
-
-        self.success_mtu_checks: bool = False
-        self.max_packed_blocks: int = 1
-        self.max_packets_per_batch: int = self.config.get("MAX_PACKETS_PER_BATCH", 3)
-
-        self.resolver_balancing_strategy: int = self.config.get(
-            "RESOLVER_BALANCING_STRATEGY", 0
+        # ---------------------------------------------------------
+        # DNS transport and listener configuration
+        # ---------------------------------------------------------
+        self.resolvers: list = self.config.get("RESOLVER_DNS_SERVERS", [])
+        self.allowed_resolver_sources = {
+            str(r).strip().lower() for r in self.resolvers if str(r).strip()
+        }
+        self.domains: list = self.config.get("DOMAINS", [])
+        self.domains_lower: tuple = tuple(
+            sorted((d.lower() for d in self.domains), key=len, reverse=True)
         )
+        self.timeout: float = self.config.get("DNS_QUERY_TIMEOUT", 5.0)
+        self.listener_ip = self.config.get("LISTEN_IP", "127.0.0.1")
+        self.listener_port = int(self.config.get("LISTEN_PORT", 1080))
+        self.buffer_size = 65507  # Max UDP payload size
+
+        # ---------------------------------------------------------
+        # MTU, batching and queueing configuration
+        # ---------------------------------------------------------
+        self.max_upload_mtu: int = self.config.get("MAX_UPLOAD_MTU", 512)
+        self.max_download_mtu: int = self.config.get("MAX_DOWNLOAD_MTU", 1200)
+        self.min_upload_mtu: int = self.config.get("MIN_UPLOAD_MTU", 0)
+        self.min_download_mtu: int = self.config.get("MIN_DOWNLOAD_MTU", 0)
+        self.mtu_test_retries: int = self.config.get("MTU_TEST_RETRIES", 2)
+        self.mtu_test_timeout: float = float(self.config.get("MTU_TEST_TIMEOUT", 1.0))
+        self.save_mtu_servers_to_file: bool = bool(
+            self.config.get("SAVE_MTU_SERVERS_TO_FILE", False)
+        )
+        self.mtu_servers_file_name: str = str(
+            self.config.get(
+                "MTU_SERVERS_FILE_NAME", "masterdnsvpn_success_test_{time}.log"
+            )
+        )
+        self.mtu_servers_file_format: str = str(
+            self.config.get(
+                "MTU_SERVERS_FILE_FORMAT",
+                "{IP} - UP: {UP_MTU} DOWN: {DOWN-MTU}",
+            )
+        )
+        self.max_packets_per_batch: int = int(
+            self.config.get("MAX_PACKETS_PER_BATCH", 100)
+        )
+        self.packet_duplication_count = self.config.get("PACKET_DUPLICATION_COUNT", 1)
+        self.upload_compression_type: int = normalize_compression_type(
+            self.config.get("UPLOAD_COMPRESSION_TYPE", Compression_Type.OFF)
+        )
+        self.download_compression_type: int = normalize_compression_type(
+            self.config.get("DOWNLOAD_COMPRESSION_TYPE", Compression_Type.OFF)
+        )
+        self.compression_min_size: int = 100
+
+        # ---------------------------------------------------------
+        # ARQ and flow-control configuration
+        # ---------------------------------------------------------
+        self.arq_window_size = self.config.get("ARQ_WINDOW_SIZE", 1000)
+        self.arq_initial_rto = self.config.get("ARQ_INITIAL_RTO", 0.2)
+        self.arq_max_rto = self.config.get("ARQ_MAX_RTO", 1.5)
+        self.rx_semaphore_limit = int(self.config.get("RX_SEMAPHORE_LIMIT", 1000))
+        self.rx_semaphore = asyncio.Semaphore(max(1, self.rx_semaphore_limit))
+
+        # ---------------------------------------------------------
+        # Crypto and payload encoding configuration
+        # ---------------------------------------------------------
+        self.base_encode_responses: bool = self.config.get("BASE_ENCODE_DATA", False)
+        self.encryption_method: int = self.config.get("DATA_ENCRYPTION_METHOD", 1)
         self.encryption_key: str = self.config.get("ENCRYPTION_KEY", None)
 
         if not self.encryption_key:
@@ -103,44 +163,111 @@ class MasterDnsVPNClient:
             input("Press Enter to exit...")
             sys.exit(1)
 
-        self.dns_parser = DnsPacketParser(
-            logger=self.logger,
-            encryption_method=self.encryption_method,
-            encryption_key=self.encryption_key,
-        )
+        self.crypto_overhead = 0
+        if self.encryption_method == 2:
+            self.crypto_overhead = 16
+        elif self.encryption_method in (3, 4, 5):
+            self.crypto_overhead = 28
 
+        # ---------------------------------------------------------
+        # Runtime state and counters
+        # ---------------------------------------------------------
+        self.success_mtu_checks: bool = False
+        self.max_packed_blocks: int = 1
         self.connections_map: list = []
         self.session_id = 0
         self.synced_upload_mtu = 0
         self.synced_upload_mtu_chars = 0
         self.synced_download_mtu = 0
-        self.buffer_size = 65507  # Max UDP payload size
+
+        self.main_queue = []
+        self.priority_counts = {}
+        self.tx_event = asyncio.Event()
+        self.enqueue_seq = 0
+        self.count_ping = 0
+
+        self.server_rtt_tracker = {}
+        self.max_closed_stream_records = int(
+            self.config.get("MAX_CLOSED_STREAM_RECORDS", 2000)
+        )
+
+        # ---------------------------------------------------------
+        # Resolver balancing and protocol helpers
+        # ---------------------------------------------------------
+        self.resolver_balancing_strategy: int = self.config.get(
+            "RESOLVER_BALANCING_STRATEGY", 0
+        )
         self.balancer = DNSBalancer(
             resolvers=self.connections_map, strategy=self.resolver_balancing_strategy
         )
-        self.server_rtt_tracker = {}
-        self.ping_manager = PingManager(self._send_ping_packet)
-        self.packet_duplication_count = self.config.get("PACKET_DUPLICATION_COUNT", 1)
-        self.rx_tasks = set()
-        self.domains: list = self.config.get("DOMAINS", [])
-        self.domains_lower: tuple = tuple(
-            sorted((d.lower() for d in self.domains), key=len, reverse=True)
-        )
-        self.main_queue = []
-        self.tx_event = asyncio.Event()
-        self.rx_semaphore = asyncio.Semaphore(200)
-        self.listener_ip = self.config.get("LISTEN_IP", "127.0.0.1")
-        self.listener_port = int(self.config.get("LISTEN_PORT", 1080))
 
-        self.arq_window_size = self.config.get("ARQ_WINDOW_SIZE", 3000)
-        self.arq_initial_rto = self.config.get("ARQ_INITIAL_RTO", 0.2)
-        self.arq_max_rto = self.config.get("ARQ_MAX_RTO", 1.5)
+        self.dns_parser = DnsPacketParser(
+            logger=self.logger,
+            encryption_method=self.encryption_method,
+            encryption_key=self.encryption_key,
+        )
+        self.ping_manager = PingManager(self._send_ping_packet)
+
+        # ---------------------------------------------------------
+        # Packet/control metadata tables
+        # ---------------------------------------------------------
+        self._block_packer = DnsPacketParser.PACKED_CONTROL_BLOCK_STRUCT
+        self._valid_packet_types = {
+            v
+            for k, v in Packet_Type.__dict__.items()
+            if not k.startswith("__") and isinstance(v, int)
+        }
+        self._control_request_ack_map = {
+            Packet_Type.STREAM_KEEPALIVE: Packet_Type.STREAM_KEEPALIVE_ACK,
+            Packet_Type.STREAM_WINDOW_UPDATE: Packet_Type.STREAM_WINDOW_UPDATE_ACK,
+            Packet_Type.STREAM_PROBE: Packet_Type.STREAM_PROBE_ACK,
+            Packet_Type.SOCKS5_CONNECT_FAIL: Packet_Type.SOCKS5_CONNECT_FAIL_ACK,
+            Packet_Type.SOCKS5_RULESET_DENIED: Packet_Type.SOCKS5_RULESET_DENIED_ACK,
+            Packet_Type.SOCKS5_NETWORK_UNREACHABLE: Packet_Type.SOCKS5_NETWORK_UNREACHABLE_ACK,
+            Packet_Type.SOCKS5_HOST_UNREACHABLE: Packet_Type.SOCKS5_HOST_UNREACHABLE_ACK,
+            Packet_Type.SOCKS5_CONNECTION_REFUSED: Packet_Type.SOCKS5_CONNECTION_REFUSED_ACK,
+            Packet_Type.SOCKS5_TTL_EXPIRED: Packet_Type.SOCKS5_TTL_EXPIRED_ACK,
+            Packet_Type.SOCKS5_COMMAND_UNSUPPORTED: Packet_Type.SOCKS5_COMMAND_UNSUPPORTED_ACK,
+            Packet_Type.SOCKS5_ADDRESS_TYPE_UNSUPPORTED: Packet_Type.SOCKS5_ADDRESS_TYPE_UNSUPPORTED_ACK,
+            Packet_Type.SOCKS5_AUTH_FAILED: Packet_Type.SOCKS5_AUTH_FAILED_ACK,
+            Packet_Type.SOCKS5_UPSTREAM_UNAVAILABLE: Packet_Type.SOCKS5_UPSTREAM_UNAVAILABLE_ACK,
+        }
+        self._control_ack_types = set(self._control_request_ack_map.values()) | {
+            Packet_Type.STREAM_SYN_ACK,
+            Packet_Type.SOCKS5_SYN_ACK,
+            Packet_Type.STREAM_FIN_ACK,
+            Packet_Type.STREAM_RST_ACK,
+        }
+        self._packable_control_types = set(self._control_ack_types)
+        self._packable_control_types.update(self._control_request_ack_map.keys())
+        self._packable_control_types.add(Packet_Type.STREAM_DATA_ACK)
+        self._packable_control_types.update(
+            {
+                Packet_Type.STREAM_SYN,
+                Packet_Type.STREAM_FIN,
+                Packet_Type.STREAM_RST,
+            }
+        )
+        self._socks5_error_reply_map = {
+            Packet_Type.SOCKS5_CONNECT_FAIL: 0x01,
+            Packet_Type.SOCKS5_RULESET_DENIED: 0x02,
+            Packet_Type.SOCKS5_NETWORK_UNREACHABLE: 0x03,
+            Packet_Type.SOCKS5_HOST_UNREACHABLE: 0x04,
+            Packet_Type.SOCKS5_CONNECTION_REFUSED: 0x05,
+            Packet_Type.SOCKS5_TTL_EXPIRED: 0x06,
+            Packet_Type.SOCKS5_COMMAND_UNSUPPORTED: 0x07,
+            Packet_Type.SOCKS5_ADDRESS_TYPE_UNSUPPORTED: 0x08,
+            Packet_Type.SOCKS5_AUTH_FAILED: 0x01,
+            Packet_Type.SOCKS5_UPSTREAM_UNAVAILABLE: 0x01,
+        }
+
+        # ---------------------------------------------------------
+        # Config version markers
+        # ---------------------------------------------------------
+        self.config_version = self.config.get("CONFIG_VERSION", 0.1)
+        self.min_config_version = 2.0
 
         self.logger.debug("<magenta>[INIT]</magenta> MasterDnsVPNClient initialized.")
-
-        self._block_packer = struct.Struct(">BHH")
-        self.config_version = self.config.get("CONFIG_VERSION", 0.1)
-        self.min_config_version = 1.0
 
     # ---------------------------------------------------------
     # Connection Management
@@ -215,30 +342,83 @@ class MasterDnsVPNClient:
         except Exception:
             pass
 
+    def _match_allowed_domain_suffix(self, qname: str) -> Optional[str]:
+        """Return the matched allowed domain suffix for qname, if any."""
+        if not qname:
+            return None
+
+        name = qname.lower()
+        for domain_suffix in self.domains_lower:
+            if name.endswith(domain_suffix):
+                return domain_suffix
+        return None
+
+    def _apply_session_compression_policy(self) -> None:
+        """
+        Decide effective per-session compression after MTU discovery.
+        Compression is disabled for a direction when synced MTU is too small.
+        """
+        up = self.upload_compression_type
+        down = self.download_compression_type
+
+        if (
+            self.synced_upload_mtu <= self.compression_min_size
+            and self.upload_compression_type != Compression_Type.OFF
+        ):
+            up = Compression_Type.OFF
+            self.logger.info(
+                f"<cyan>[Compression]</cyan> Upload compression disabled due to small MTU: {self.synced_upload_mtu}"
+            )
+
+        if (
+            self.synced_download_mtu <= self.compression_min_size
+            and self.download_compression_type != Compression_Type.OFF
+        ):
+            down = Compression_Type.OFF
+            self.logger.info(
+                f"<cyan>[Compression]</cyan> Download compression disabled due to small MTU: {self.synced_download_mtu}"
+            )
+
+        self.upload_compression_type = up
+        self.download_compression_type = down
+
+        self.logger.info(
+            f"<cyan>[Compression]</cyan> <green>Effective Compression - Upload: <yellow>{get_compression_name(up)}</yellow>, Download: <yellow>{get_compression_name(down)}</yellow></green>"
+        )
+
     async def _process_received_packet(
         self, response_bytes: bytes, addr=None
     ) -> Tuple[Optional[dict], bytes]:
-        """Parse raw DNS response, extract VPN header, and return packet type."""
+        """Parse DNS response, validate source/domain once, then extract VPN payload."""
         if not response_bytes:
             return None, b""
 
         parsed = self.dns_parser.parse_dns_packet(response_bytes)
-        if addr and parsed and parsed.get("questions"):
-            try:
-                qname = parsed["questions"][0].get("qName", "").lower()
-                if qname.endswith(self.domains_lower):
-                    for d in self.domains_lower:
-                        if qname.endswith(d):
-                            server_key = f"{addr[0]}:{d}"
-                            sent_time = self.server_rtt_tracker.get(server_key, 0.0)
-                            calc_rtt = (
-                                time.monotonic() - sent_time if sent_time > 0.0 else 0.0
-                            )
+        if not parsed or not parsed.get("questions"):
+            return None, b""
 
-                            self.balancer.report_success(server_key, rtt=calc_rtt)
-                            break
-            except Exception:
-                pass
+        try:
+            qname = parsed["questions"][0].get("qName", "")
+            matched_domain = self._match_allowed_domain_suffix(qname)
+            if not matched_domain:
+                return None, b""
+
+            if addr:
+                source_ip = str(addr[0]).strip().lower()
+                if (
+                    self.allowed_resolver_sources
+                    and source_ip not in self.allowed_resolver_sources
+                ):
+                    return None, b""
+
+                server_key = f"{source_ip}:{matched_domain}"
+                sent_time = self.server_rtt_tracker.pop(server_key, 0.0)
+                if sent_time > 0.0:
+                    self.balancer.report_success(
+                        server_key, rtt=(time.monotonic() - sent_time)
+                    )
+        except Exception:
+            return None, b""
 
         return self.dns_parser.extract_vpn_response(
             parsed, is_encoded=self.base_encode_responses
@@ -646,15 +826,15 @@ class MasterDnsVPNClient:
             )
             has_info = True
 
-        if self.arq_window_size < 3000:
+        if self.arq_window_size < 500:
             self.logger.warning(
-                f"<yellow>🔸 [Throughput]: <cyan>ARQ_WINDOW_SIZE</cyan> is <red>{self.arq_window_size}</red>. Increase to <green>3000</green>+ for high speeds.</yellow>"
+                f"<yellow>🔸 [Throughput]: <cyan>ARQ_WINDOW_SIZE</cyan> is <red>{self.arq_window_size}</red>. Increase to <green>500</green>+ for high speeds.</yellow>"
             )
             has_warnings = True
 
-        if self.max_packets_per_batch > 5:
+        if self.max_packets_per_batch < 10:
             self.logger.warning(
-                f"<yellow>🔸 [Performance]: <cyan>MAX_PACKETS_PER_BATCH</cyan> is set to <red>{self.max_packets_per_batch}</red>. Reduce to <green>1-5</green> for better performance. Higher values can increase latency and reduce performance due to larger batch processing times. Recommended: <green>1-3</green>.</yellow>"
+                f"<yellow>🔸 [Performance]: <cyan>MAX_PACKETS_PER_BATCH</cyan> is low (<red>{self.max_packets_per_batch}</red>). Consider increasing to <green>10</green>+ for better performance.</yellow>"
             )
             has_warnings = True
 
@@ -823,6 +1003,107 @@ class MasterDnsVPNClient:
                 "\n<green>✅ Your configuration looks great! No critical warnings found. 🚀</green>"
             )
 
+    def _resolve_mtu_success_output_path(self) -> str:
+        if not self.save_mtu_servers_to_file:
+            return ""
+
+        raw_name = (self.mtu_servers_file_name or "").strip()
+        if not raw_name:
+            self.logger.warning(
+                "<yellow>MTU result saving is enabled, but MTU_SERVERS_FILE_NAME is empty.</yellow>"
+            )
+            return ""
+
+        if "{time}" in raw_name:
+            ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+            base_name = raw_name.replace("{time}", "").strip()
+            if not base_name:
+                base_name = "masterdnsvpn_success_test"
+
+            root, ext = os.path.splitext(base_name)
+            if not root:
+                root = base_name
+            if not ext:
+                ext = ".log"
+
+            raw_name = f"{root}_{ts}{ext}"
+
+        return os.path.abspath(raw_name)
+
+    def _prepare_mtu_success_output_file(self) -> str:
+        output_path = self._resolve_mtu_success_output_path()
+        if not output_path:
+            return ""
+
+        try:
+            output_dir = os.path.dirname(output_path)
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+
+            # Rewrite file from scratch at test start.
+            with open(output_path, "w", encoding="utf-8"):
+                pass
+
+            self.logger.info(
+                f"<blue>[MTU]</blue> Success output file initialized: <cyan>{output_path}</cyan>"
+            )
+            return output_path
+        except Exception as e:
+            self.logger.warning(
+                f"<yellow>[MTU]</yellow> Failed to initialize output file <cyan>{output_path}</cyan>: {e}"
+            )
+            return ""
+
+    def _format_mtu_success_line(self, connection: dict) -> str:
+        template = (
+            self.mtu_servers_file_format or "{IP} - UP: {UP_MTU} DOWN: {DOWN-MTU}"
+        )
+
+        ip_value = str(connection.get("resolver", ""))
+        up_mtu_value = str(connection.get("upload_mtu_bytes", 0))
+        down_mtu_value = str(connection.get("download_mtu_bytes", 0))
+        up_chars_value = str(connection.get("upload_mtu_chars", 0))
+        domain_value = str(connection.get("domain", ""))
+
+        line = str(template)
+        replacements = {
+            "{IP}": ip_value,
+            "{ip}": ip_value,
+            "{RESOLVER}": ip_value,
+            "{resolver}": ip_value,
+            "{UP_MTU}": up_mtu_value,
+            "{up_mtu}": up_mtu_value,
+            "{DOWN_MTU}": down_mtu_value,
+            "{down_mtu}": down_mtu_value,
+            "{DOWN-MTU}": down_mtu_value,
+            "{down-mtu}": down_mtu_value,
+            "{UP_MTU_CHARS}": up_chars_value,
+            "{up_mtu_chars}": up_chars_value,
+            "{DOMAIN}": domain_value,
+            "{domain}": domain_value,
+            "{TIME}": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            "{time}": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+        }
+
+        for token, value in replacements.items():
+            line = line.replace(token, value)
+
+        return line
+
+    def _append_mtu_success_line(self, output_path: str, connection: dict) -> None:
+        if not output_path:
+            return
+
+        try:
+            line = self._format_mtu_success_line(connection).rstrip("\r\n") + "\n"
+            with open(output_path, "a", encoding="utf-8") as f:
+                f.write(line)
+                f.flush()
+        except Exception as e:
+            self.logger.warning(
+                f"<yellow>[MTU]</yellow> Failed to append MTU success line: {e}"
+            )
+
     async def test_mtu_sizes(self) -> bool:
 
         try:
@@ -835,6 +1116,7 @@ class MasterDnsVPNClient:
 
         server_id = 0
         total_conns = len(self.connections_map)
+        mtu_output_path = self._prepare_mtu_success_output_file()
 
         for connection in self.connections_map:
             if self.should_stop.is_set():
@@ -900,6 +1182,8 @@ class MasterDnsVPNClient:
                 f"<green>✅ Valid: {domain} via <green>{resolver}</green> | "
                 f"Upload MTU: <cyan>{up_mtu_bytes}</cyan> | Download MTU: <cyan>{down_mtu_bytes}</cyan> - (<green>V: {valid_count}</green>, <red>E: {errors_count}</red>, <yellow>{server_id} / {total_conns}</yellow>)</green>"
             )
+
+            self._append_mtu_success_line(mtu_output_path, connection)
 
         valid_conns = [c for c in self.connections_map if c.get("is_valid")]
         if not valid_conns:
@@ -1013,7 +1297,13 @@ class MasterDnsVPNClient:
 
             init_token = os.urandom(8).hex().encode("ascii")
             flag_byte = b"\x01" if self.base_encode_responses else b"\x00"
-            payload = init_token + flag_byte
+            compression_pref_byte = bytes(
+                [
+                    ((self.upload_compression_type & 0x0F) << 4)
+                    | (self.download_compression_type & 0x0F)
+                ]
+            )
+            payload = init_token + flag_byte + compression_pref_byte
 
             encrypted_token = self.dns_parser.codec_transform(payload, encrypt=True)
 
@@ -1082,24 +1372,8 @@ class MasterDnsVPNClient:
         """Run the MasterDnsVPN Client main logic."""
         self.logger.info("Setting up connections...")
         all_resolvers = 0
-        self.count_ping = 0
-        self.enqueue_seq = 0
-        self.main_queue = []
-        self.tx_event = asyncio.Event()
-        self.round_robin_index = 0
-        self.last_stream_id = 0
-
-        self.active_streams = {}
-        self.closed_streams = {}
-
-        self.count_ack = 0
-        self.count_data = 0
-        self.count_resend = 0
-        self.count_ping = 0
-        self.track_ack = set()
-        self.track_resend = set()
-        self.track_types = set()
-        self.track_data = set()
+        self._reset_tunnel_runtime_state()
+        self.session_id = 0
         try:
             self.session_restart_event = asyncio.Event()
 
@@ -1131,18 +1405,15 @@ class MasterDnsVPNClient:
                     64, self.synced_upload_mtu - self.crypto_overhead
                 )
 
-                remaining_mtu_space = (
-                    self.safe_uplink_mtu - 4
-                )  # 4 bytes for os.urandom(4) to avoid DNS caching
-
+                upload_pack_limit = self._compute_mtu_based_pack_limit(
+                    self.synced_upload_mtu,
+                    50.0,
+                    self._block_packer.size,
+                )
                 self.max_packed_blocks = max(
                     1,
-                    min(
-                        remaining_mtu_space // 5,
-                        self.config.get("MAX_PACKETS_PER_BATCH", 3),
-                    ),
-                )  # Each block is 5 bytes (1 byte type + 2 bytes stream ID + 2 bytes seq num)
-
+                    min(upload_pack_limit, self.max_packets_per_batch),
+                )
                 max_found_upload_mtu = max(c["upload_mtu_bytes"] for c in valid_conns)
                 max_found_download_mtu = max(
                     c["download_mtu_bytes"] for c in valid_conns
@@ -1190,6 +1461,7 @@ class MasterDnsVPNClient:
                 self.logger.error("No active servers available from Balancer.")
                 return
             max_attempts = self.config.get("MAX_CONNECTION_ATTEMPTS", 10)
+            self._apply_session_compression_policy()
             if not await self._init_session(max_attempts):
                 self.logger.error("Failed to initialize session with the server.")
                 return
@@ -1211,27 +1483,66 @@ class MasterDnsVPNClient:
     # ---------------------------------------------------------
     # TCP Multiplexing Logic & Handlers
     # ---------------------------------------------------------
-    async def _main_tunnel_loop(self):
-        """Start local TCP server and main worker tasks."""
-        self.logger.info("<blue>Entering VPN Tunnel Main Loop...</blue>")
-        self.main_queue = []
+    def _reset_tunnel_runtime_state(self) -> None:
+        """
+        Reset reconnect-sensitive runtime state.
+        IMPORTANT: MTU discovery fields are intentionally preserved.
+        """
+        self.count_ping = 0
+        self.enqueue_seq = 0
         self.round_robin_index = 0
+        self.last_stream_id = 0
+
+        self.main_queue = []
         self.tx_event = asyncio.Event()
 
         self.active_streams = {}
         self.closed_streams = {}
-        self.enqueue_seq = 0
-        self.last_stream_id = 0
-
-        self.count_ack = 0
-        self.count_data = 0
-        self.count_resend = 0
-        self.count_ping = 0
+        self.priority_counts = {}
         self.track_ack = set()
         self.track_resend = set()
         self.track_types = set()
         self.track_data = set()
+        self.rx_tasks = set()
 
+        ping_mgr = getattr(self, "ping_manager", None)
+        if ping_mgr:
+            now = time.monotonic()
+            ping_mgr.active_connections = 0
+            ping_mgr.last_data_activity = now
+            ping_mgr.last_ping_time = now
+
+    def _clear_runtime_state_after_disconnect(self) -> None:
+        """
+        Best-effort cleanup after tunnel disconnect/restart.
+        IMPORTANT: MTU discovery fields are intentionally preserved.
+        """
+        try:
+            self.main_queue.clear()
+            self.track_ack.clear()
+            self.track_resend.clear()
+            self.track_types.clear()
+            self.track_data.clear()
+            self.priority_counts.clear()
+            self.active_streams.clear()
+            self.closed_streams.clear()
+            self.rx_tasks.clear()
+        except Exception:
+            pass
+
+        self.tx_event = asyncio.Event()
+
+        ping_mgr = getattr(self, "ping_manager", None)
+        if ping_mgr:
+            now = time.monotonic()
+            ping_mgr.active_connections = 0
+            ping_mgr.last_data_activity = now
+            ping_mgr.last_ping_time = now
+
+    async def _main_tunnel_loop(self):
+        """Start local TCP server and main worker tasks."""
+        self.logger.info("<blue>Entering VPN Tunnel Main Loop...</blue>")
+        self._reset_tunnel_runtime_state()
         self.tunnel_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             buffer_size = int(self.config.get("SOCKET_BUFFER_SIZE", 8388608))
@@ -1265,6 +1576,8 @@ class MasterDnsVPNClient:
         listen_port = int(self.listener_port)
 
         server = None
+        stop_task = None
+        restart_task = None
         try:
             if sys.platform == "win32":
                 server = await asyncio.start_server(
@@ -1283,11 +1596,9 @@ class MasterDnsVPNClient:
                 )
 
             if self.protocol_type == "SOCKS5":
-                if self.config.get("AUTH_USERNAME") and self.config.get(
-                    "AUTH_PASSWORD"
-                ):
+                if self.config.get("SOCKS5_USER") and self.config.get("SOCKS5_PASS"):
                     self.logger.info(
-                        f"<green>SOCKS5 Proxy started on {listen_port} with Authentication. Username: <cyan>{self.config.get('AUTH_USERNAME')}</cyan></green>"
+                        f"<green>SOCKS5 Proxy started on {listen_port} with Authentication. Username: <cyan>{self.config.get('SOCKS5_USER')}</cyan></green>"
                     )
                 else:
                     self.logger.info(
@@ -1338,8 +1649,18 @@ class MasterDnsVPNClient:
                     pass
 
             close_tasks = []
+            is_restart = bool(
+                self.session_restart_event and self.session_restart_event.is_set()
+            )
+            close_reason = "Client Restarting" if is_restart else "Client App Closing"
             for sid in list(self.active_streams.keys()):
-                close_tasks.append(self.close_stream(sid, reason="Client App Closing"))
+                close_tasks.append(
+                    self.close_stream(
+                        sid,
+                        reason=close_reason,
+                        abortive=is_restart,
+                    )
+                )
 
             if close_tasks:
                 try:
@@ -1349,7 +1670,6 @@ class MasterDnsVPNClient:
                     )
                 except Exception:
                     pass
-
             for task in list(self.rx_tasks):
                 if not task.done():
                     task.cancel()
@@ -1365,25 +1685,24 @@ class MasterDnsVPNClient:
                     self.tunnel_sock.close()
                 except Exception:
                     pass
+                self.tunnel_sock = None
 
-            try:
-                self.main_queue.clear()
-                self.track_ack.clear()
-                self.track_resend.clear()
-                self.track_types.clear()
-                self.track_data.clear()
-            except Exception:
-                pass
+            self._clear_runtime_state_after_disconnect()
 
-        if not stop_task.done():
+        if stop_task and not stop_task.done():
             stop_task.cancel()
-        if not restart_task.done():
+        if restart_task and not restart_task.done():
             restart_task.cancel()
+        if stop_task or restart_task:
+            await asyncio.gather(
+                *(t for t in (stop_task, restart_task) if t),
+                return_exceptions=True,
+            )
 
         self.logger.info(
             "<yellow>Cleaning up old connections before reconnecting...</yellow>"
         )
-        self.active_streams.clear()
+        self._clear_runtime_state_after_disconnect()
 
     async def _rx_worker(self):
         """Continuously listen for incoming VPN packets on the tunnel socket."""
@@ -1445,6 +1764,16 @@ class MasterDnsVPNClient:
             stream_id += 1
 
         return False, 0
+
+    def _is_socks5_error_packet(self, packet_type: int) -> bool:
+        return int(packet_type) in self._socks5_error_reply_map
+
+    def _packet_type_to_socks5_rep(self, packet_type: int) -> int:
+        return int(self._socks5_error_reply_map.get(int(packet_type), 0x01))
+
+    def _build_socks5_fail_reply(self, packet_type: int) -> bytes:
+        rep = self._packet_type_to_socks5_rep(packet_type)
+        return bytes([0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
 
     async def _handle_local_tcp_connection(self, reader, writer):
         if self.should_stop.is_set() or (
@@ -1601,11 +1930,7 @@ class MasterDnsVPNClient:
             "stream_creating": False,
             "tx_queue": [],
             "initial_payload": target_payload,
-            "count_ack": 0,
-            "count_data": 0,
-            "count_resend": 0,
-            "count_fin": 0,
-            "count_syn_ack": 0,
+            "priority_counts": {},
             "track_ack": set(),
             "track_resend": set(),
             "track_fin": set(),
@@ -1614,13 +1939,9 @@ class MasterDnsVPNClient:
         }
 
         if not is_socks5:
-            self.enqueue_seq = (self.enqueue_seq + 1) & 0x7FFFFFFF
-
-            heapq.heappush(
-                self.active_streams[stream_id]["tx_queue"],
-                (0, self.enqueue_seq, Packet_Type.STREAM_SYN, stream_id, 0, syn_data),
+            await self._enqueue_packet(
+                0, stream_id, 0, Packet_Type.STREAM_SYN, syn_data
             )
-            self.tx_event.set()
         else:
             self.active_streams[stream_id]["handshake_event"] = asyncio.Event()
 
@@ -1629,13 +1950,18 @@ class MasterDnsVPNClient:
             try:
                 await asyncio.wait_for(
                     self.active_streams[stream_id]["handshake_event"].wait(),
-                    timeout=60.0,
+                    timeout=self.socks_handshake_timeout,
                 )
 
-                if (
-                    stream_id in self.active_streams
-                    and self.active_streams[stream_id].get("status") == "ACTIVE"
-                ):
+                stream_data = self.active_streams.get(stream_id)
+                if not stream_data:
+                    raise ConnectionError("Stream closed before handshake completion.")
+
+                socks_err_ptype = stream_data.get("socks_error_packet")
+                if socks_err_ptype is not None:
+                    raise ConnectionError(f"SOCKS handshake failed ({socks_err_ptype})")
+
+                if stream_data.get("status") == "ACTIVE":
                     if writer and not writer.is_closing():
                         reply = b"\x05\x00\x00"  # VER, REP=0(success), RSV
                         if atyp == 0x01:
@@ -1649,7 +1975,7 @@ class MasterDnsVPNClient:
                             writer.write(reply)
                             await writer.drain()
 
-                            stream_obj = self.active_streams[stream_id].get("stream")
+                            stream_obj = stream_data.get("stream")
                             if (
                                 stream_obj
                                 and hasattr(stream_obj, "socks_connected")
@@ -1671,34 +1997,36 @@ class MasterDnsVPNClient:
                 else:
                     raise ConnectionError("Stream closed before handshake completion.")
 
-            except Exception as e:
-                err_text = str(e)
-
-                if err_text == "Local writer closed before SOCKS5 reply.":
-                    self.logger.debug(err_text)
-                    await self.close_stream(
-                        stream_id,
-                        reason=err_text,
-                        abortive=True,
-                    )
-                    return
-
-                self.logger.debug(f"SOCKS Target Rejected by Server: {e}")
+            except asyncio.TimeoutError:
+                stream_data = self.active_streams.get(stream_id, {})
+                socks_err_ptype = stream_data.get(
+                    "socks_error_packet", Packet_Type.SOCKS5_UPSTREAM_UNAVAILABLE
+                )
+                self.logger.debug(
+                    f"SOCKS handshake timed out for stream {stream_id} after {self.socks_handshake_timeout:.1f}s"
+                )
                 try:
-                    writer.write(b"\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00")
+                    fail_reply = self._build_socks5_fail_reply(socks_err_ptype)
+                    writer.write(fail_reply)
                     await writer.drain()
                 except Exception:
                     pass
                 await self.close_stream(
                     stream_id,
-                    reason="SOCKS Target Rejected by Server",
+                    reason="SOCKS handshake timeout",
                     abortive=True,
                 )
+                return
 
             except Exception as e:
+                stream_data = self.active_streams.get(stream_id, {})
+                socks_err_ptype = stream_data.get("socks_error_packet")
                 self.logger.debug(f"SOCKS Target Rejected by Server: {e}")
                 try:
-                    writer.write(b"\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00")
+                    fail_reply = self._build_socks5_fail_reply(
+                        socks_err_ptype or Packet_Type.SOCKS5_CONNECT_FAIL
+                    )
+                    writer.write(fail_reply)
                     await writer.drain()
                 except Exception:
                     pass
@@ -1718,6 +2046,7 @@ class MasterDnsVPNClient:
             stream_id=stream_id,
             session_id=self.session_id,
             enqueue_tx_cb=self._client_enqueue_tx,
+            enqueue_control_tx_cb=self._client_enqueue_control_tx,
             reader=reader,
             writer=writer,
             mtu=self.safe_uplink_mtu,
@@ -1725,137 +2054,105 @@ class MasterDnsVPNClient:
             window_size=int(self.arq_window_size),
             rto=float(self.arq_initial_rto),
             max_rto=float(self.arq_max_rto),
+            enable_control_reliability=True,
+            control_rto=float(self.config.get("ARQ_CONTROL_INITIAL_RTO", 0.8)),
+            control_max_rto=float(self.config.get("ARQ_CONTROL_MAX_RTO", 2.5)),
+            control_max_retries=int(self.config.get("ARQ_CONTROL_MAX_RETRIES", 40)),
             is_socks=True,
-            initial_data=target_payload,
+            initial_data=b"",
         )
         stream_data["stream"] = stream
+        stream_data.pop("socks_error_packet", None)
+        await stream.send_control_packet(
+            packet_type=Packet_Type.SOCKS5_SYN,
+            sequence_num=0,
+            payload=target_payload,
+            priority=0,
+            track_for_ack=True,
+            ack_type=Packet_Type.SOCKS5_SYN_ACK,
+        )
         self.logger.debug(
             f"<green>SOCKS5 Stream <cyan>{stream_id}</cyan> Created and queued SOCKS5_SYN chunks.</green>"
         )
         self._send_ping_packet()
 
+    # ---------------------------------------------------------
+    # ARQ Enqueue Adapters
+    # ---------------------------------------------------------
     async def _client_enqueue_tx(
         self,
         priority,
         stream_id,
         sn,
         data,
-        is_ack=False,
-        is_fin=False,
-        is_fin_ack=False,
-        is_rst=False,
-        is_rst_ack=False,
-        is_resend=False,
-        is_socks_syn=False,
+        **flags,
     ):
         if self.should_stop.is_set() or (
             self.session_restart_event and self.session_restart_event.is_set()
         ):
             return
 
-        ptype = Packet_Type.STREAM_DATA
-        effective_priority = priority
+        ptype = self._resolve_arq_packet_type(**flags)
+        await self._enqueue_packet(priority, stream_id, sn, ptype, data)
 
-        if is_socks_syn:
-            ptype = Packet_Type.SOCKS5_SYN
-            effective_priority = priority
-        elif is_ack:
-            ptype = Packet_Type.STREAM_DATA_ACK
-            effective_priority = 0
-        elif is_fin_ack:
-            ptype = Packet_Type.STREAM_FIN_ACK
-            effective_priority = 0
-        elif is_rst_ack:
-            ptype = Packet_Type.STREAM_RST_ACK
-            effective_priority = 0
-        elif is_rst:
-            ptype = Packet_Type.STREAM_RST
-            effective_priority = 0
-        elif is_fin:
-            ptype = Packet_Type.STREAM_FIN
-            effective_priority = 4
-        elif is_resend:
-            ptype = Packet_Type.STREAM_RESEND
-            effective_priority = 1
+    async def _client_enqueue_control_tx(
+        self,
+        priority,
+        stream_id,
+        sn,
+        packet_type,
+        payload,
+        is_retransmit=False,
+    ):
+        _ = is_retransmit
+        await self._enqueue_packet(
+            priority, stream_id, sn, int(packet_type), payload or b""
+        )
+
+    async def _enqueue_packet(self, priority, stream_id, sn, packet_type, data):
+        ptype = int(packet_type)
+        effective_priority = self._effective_priority_for_packet(ptype, priority)
 
         self.enqueue_seq = (self.enqueue_seq + 1) & 0x7FFFFFFF
-        queue_item = (effective_priority, self.enqueue_seq, ptype, stream_id, sn, data)
+        queue_item = (
+            effective_priority,
+            self.enqueue_seq,
+            ptype,
+            stream_id,
+            sn,
+            data,
+        )
 
         if stream_id == 0:
-            if is_resend:
-                if sn in self.track_data:
-                    return
-                if sn in self.track_resend:
-                    return
-                self.track_resend.add(sn)
-                self.count_resend += 1
-
-            elif ptype in (
-                Packet_Type.STREAM_FIN,
-                Packet_Type.STREAM_SYN,
-                Packet_Type.STREAM_SYN_ACK,
-            ):
-                if ptype in self.track_types:
-                    return
-                self.track_types.add(ptype)
-
-            elif ptype == Packet_Type.STREAM_DATA_ACK:
-                if sn in self.track_ack:
-                    return
-                self.track_ack.add(sn)
-                self.count_ack += 1
-
-            elif ptype == Packet_Type.STREAM_DATA:
-                if sn in self.track_data:
-                    return
-                self.track_data.add(sn)
-                self.count_data += 1
-
-            heapq.heappush(self.main_queue, queue_item)
-            self.tx_event.set()
-
-        else:
-            stream_data = self.active_streams.get(stream_id)
-            if not stream_data:
-                if is_rst or is_fin_ack or is_rst_ack:
-                    heapq.heappush(self.main_queue, queue_item)
-                    self.tx_event.set()
+            if not self._track_main_packet_once(self.__dict__, ptype, sn):
                 return
+            self._push_queue_item(
+                self.main_queue, self.__dict__, queue_item, self.tx_event
+            )
+            return
 
-            if is_resend:
-                if sn in stream_data["track_data"]:
-                    return
-                if sn in stream_data["track_resend"]:
-                    return
-                stream_data["track_resend"].add(sn)
-                stream_data["count_resend"] += 1
+        stream_data = self.active_streams.get(stream_id)
+        if not stream_data:
+            if ptype in (
+                Packet_Type.STREAM_RST,
+                Packet_Type.STREAM_RST_ACK,
+                Packet_Type.STREAM_FIN_ACK,
+            ):
+                self._push_queue_item(
+                    self.main_queue, self.__dict__, queue_item, self.tx_event
+                )
+            return
 
-            elif ptype == Packet_Type.STREAM_FIN:
-                if ptype in stream_data["track_fin"]:
-                    return
-                stream_data["track_fin"].add(ptype)
-                stream_data["count_fin"] += 1
-
-            elif ptype == Packet_Type.STREAM_SYN_ACK:
-                if ptype in stream_data["track_syn_ack"]:
-                    return
-                stream_data["track_syn_ack"].add(ptype)
-                stream_data["count_syn_ack"] += 1
-
-            elif ptype == Packet_Type.STREAM_DATA_ACK:
-                if sn in stream_data["track_ack"]:
-                    return
-                stream_data["track_ack"].add(sn)
-                stream_data["count_ack"] += 1
-
-            elif ptype in (Packet_Type.STREAM_DATA, Packet_Type.SOCKS5_SYN):
-                if sn in stream_data["track_data"]:
-                    return
-                stream_data["track_data"].add(sn)
-                stream_data["count_data"] += 1
-
-            heapq.heappush(stream_data["tx_queue"], queue_item)
-            self.tx_event.set()
+        if not self._track_stream_packet_once(
+            stream_data,
+            ptype,
+            sn,
+            data_packet_types=(Packet_Type.STREAM_DATA, Packet_Type.SOCKS5_SYN),
+        ):
+            return
+        self._push_queue_item(
+            stream_data["tx_queue"], stream_data, queue_item, self.tx_event
+        )
 
     async def _tx_worker(self):
         while not self.should_stop.is_set() and not self.session_restart_event.is_set():
@@ -1870,6 +2167,7 @@ class MasterDnsVPNClient:
             target_queue = None
             is_main = False
             selected_stream_data = None
+            selected_sid = None
 
             active_sids = [
                 sid for sid, s in self.active_streams.items() if s.get("tx_queue")
@@ -1899,108 +2197,66 @@ class MasterDnsVPNClient:
 
             if target_queue:
                 item = heapq.heappop(target_queue)
-                q_ptype, q_stream_id, q_sn = item[2], item[3], item[4]
+                q_ptype = item[2]
 
                 if is_main:
-                    if q_ptype == Packet_Type.STREAM_DATA:
-                        self.track_data.discard(q_sn)
-                        if self.count_data > 0:
-                            self.count_data -= 1
-                    elif q_ptype == Packet_Type.STREAM_DATA_ACK:
-                        self.track_ack.discard(q_sn)
-                        if self.count_ack > 0:
-                            self.count_ack -= 1
-                    elif q_ptype == Packet_Type.STREAM_RESEND:
-                        self.track_resend.discard(q_sn)
-                        if self.count_resend > 0:
-                            self.count_resend -= 1
-                    elif q_ptype in (
-                        Packet_Type.STREAM_FIN,
-                        Packet_Type.STREAM_SYN,
-                        Packet_Type.STREAM_SYN_ACK,
-                    ):
-                        self.track_types.discard(q_ptype)
-                    elif q_ptype == Packet_Type.PING:
-                        if self.count_ping > 0:
-                            self.count_ping -= 1
-                else:
-                    if q_ptype in (Packet_Type.STREAM_DATA, Packet_Type.SOCKS5_SYN):
-                        selected_stream_data["track_data"].discard(q_sn)
-                        if selected_stream_data["count_data"] > 0:
-                            selected_stream_data["count_data"] -= 1
-                    elif q_ptype == Packet_Type.STREAM_DATA_ACK:
-                        selected_stream_data["track_ack"].discard(q_sn)
-                        if selected_stream_data["count_ack"] > 0:
-                            selected_stream_data["count_ack"] -= 1
-                    elif q_ptype == Packet_Type.STREAM_RESEND:
-                        selected_stream_data["track_resend"].discard(q_sn)
-                        if selected_stream_data["count_resend"] > 0:
-                            selected_stream_data["count_resend"] -= 1
-                    elif q_ptype == Packet_Type.STREAM_FIN:
-                        selected_stream_data["track_fin"].discard(q_ptype)
-                        if selected_stream_data["count_fin"] > 0:
-                            selected_stream_data["count_fin"] -= 1
-                    elif q_ptype == Packet_Type.STREAM_SYN_ACK:
-                        selected_stream_data["track_syn_ack"].discard(q_ptype)
-                        if selected_stream_data["count_syn_ack"] > 0:
-                            selected_stream_data["count_syn_ack"] -= 1
+                    self._on_queue_pop(self.__dict__, item)
+                    if q_ptype == Packet_Type.PING and self.count_ping > 0:
+                        self.count_ping -= 1
+                elif selected_stream_data is not None:
+                    self._on_queue_pop(selected_stream_data, item)
 
             if (
                 item
-                and item[2] == Packet_Type.STREAM_DATA_ACK
+                and item[2] in self._packable_control_types
+                and not item[5]
                 and self.max_packed_blocks > 1
             ):
                 _pack = self._block_packer.pack
                 packed_buffer = bytearray(_pack(item[2], item[3], item[4]))
                 blocks = 1
                 max_blocks = self.max_packed_blocks
+                target_priority = int(item[0])
 
-                mq = getattr(self, "main_queue", [])
-                while self.count_ack > 0 and mq and blocks < max_blocks:
-                    if mq[0][2] == Packet_Type.STREAM_DATA_ACK:
-                        popped = heapq.heappop(mq)
-                        self.track_ack.discard(popped[4])
-                        self.count_ack -= 1
+                candidate_queues = []
+                ordered_sids = active_sids
+                if (not is_main) and selected_sid in active_sids:
+                    start_idx = active_sids.index(selected_sid)
+                    ordered_sids = active_sids[start_idx:] + active_sids[:start_idx]
+
+                for sid in ordered_sids:
+                    s_data = self.active_streams.get(sid)
+                    if s_data and s_data.get("tx_queue"):
+                        candidate_queues.append((s_data["tx_queue"], s_data))
+
+                # main_queue is a fallback/source for same-priority compact controls.
+                if self.main_queue:
+                    candidate_queues.append((self.main_queue, self.__dict__))
+                while blocks < max_blocks:
+                    packed_any = False
+                    for q_ref, owner in candidate_queues:
+                        popped = self._pop_packable_control_block(
+                            q_ref, owner, target_priority
+                        )
+                        if popped is None:
+                            continue
                         packed_buffer.extend(_pack(popped[2], popped[3], popped[4]))
                         blocks += 1
-                    else:
-                        break
-
-                if blocks < max_blocks and active_sids:
-                    start_idx = self.round_robin_index
-                    num_active = len(active_sids)
-
-                    for offset in range(num_active):
+                        packed_any = True
                         if blocks >= max_blocks:
                             break
+                    if not packed_any:
+                        break
 
-                        sid = active_sids[(start_idx + offset) % num_active]
-                        s_data = self.active_streams[sid]
-
-                        if s_data["count_ack"] > 0:
-                            t_q = s_data["tx_queue"]
-                            while (
-                                s_data["count_ack"] > 0 and t_q and blocks < max_blocks
-                            ):
-                                if t_q[0][2] == Packet_Type.STREAM_DATA_ACK:
-                                    popped = heapq.heappop(t_q)
-                                    s_data["track_ack"].discard(popped[4])
-                                    s_data["count_ack"] -= 1
-                                    packed_buffer.extend(
-                                        _pack(popped[2], popped[3], popped[4])
-                                    )
-                                    blocks += 1
-                                else:
-                                    break
-
-                item = (
-                    item[0],
-                    item[1],
-                    Packet_Type.PACKED_CONTROL_BLOCKS,
-                    0,
-                    0,
-                    bytes(packed_buffer),
-                )
+                if blocks > 1:
+                    item = (
+                        item[0],
+                        item[1],
+                        Packet_Type.PACKED_CONTROL_BLOCKS,
+                        0,
+                        0,
+                        bytes(packed_buffer),
+                    )
 
             if not item:
                 continue
@@ -2028,8 +2284,17 @@ class MasterDnsVPNClient:
         if stream_id in self.active_streams:
             now_mono = time.monotonic()
             self.active_streams[stream_id]["last_activity_time"] = now_mono
-
         try:
+            actual_comp_type = 0
+            if (
+                data
+                and self.upload_compression_type != Compression_Type.OFF
+                and pkt_type in self.dns_parser._PT_COMP_EXT
+            ):
+                data, actual_comp_type = compress_payload(
+                    data, self.upload_compression_type, self.compression_min_size
+                )
+
             data_encrypted = (
                 self.dns_parser.codec_transform(data, encrypt=True) if data else b""
             )
@@ -2051,6 +2316,7 @@ class MasterDnsVPNClient:
                     qType=DNS_Record_Type.TXT,
                     stream_id=stream_id,
                     sequence_num=sn,
+                    compression_type=actual_comp_type,
                 )
 
                 if not query_packets:
@@ -2069,44 +2335,100 @@ class MasterDnsVPNClient:
         except Exception as e:
             self.logger.debug(f"TX Worker error during packet building/sending: {e}")
 
+    async def _handle_closed_stream_packet(
+        self, ptype: int, stream_id: int, sn: int
+    ) -> bool:
+        if stream_id <= 0 or stream_id not in self.closed_streams:
+            return False
+
+        if ptype == Packet_Type.STREAM_FIN:
+            await self._enqueue_packet(
+                0, stream_id, sn, Packet_Type.STREAM_FIN_ACK, b""
+            )
+            return True
+        if ptype == Packet_Type.STREAM_RST:
+            await self._enqueue_packet(
+                0, stream_id, sn, Packet_Type.STREAM_RST_ACK, b""
+            )
+            return True
+        if ptype in (
+            Packet_Type.STREAM_DATA,
+            Packet_Type.STREAM_RESEND,
+            Packet_Type.STREAM_DATA_ACK,
+        ):
+            await self._enqueue_packet(
+                0,
+                stream_id,
+                0,
+                Packet_Type.STREAM_RST,
+                b"RST:" + os.urandom(4),
+            )
+            return True
+        return False
+
     async def _handle_server_response(self, header, data):
-        ptype = header["packet_type"]
+        ptype = int(header["packet_type"])
         header_session_id = header.get("session_id", -1)
 
         if header_session_id != self.session_id and ptype != Packet_Type.SESSION_ACCEPT:
             return
 
+        if data and ptype in self.dns_parser._PT_COMP_EXT:
+            comp_type = int(
+                header.get("compression_type", Compression_Type.OFF)
+                or Compression_Type.OFF
+            )
+            if comp_type != Compression_Type.OFF:
+                data, ok = try_decompress_payload(data, comp_type)
+                if not ok:
+                    # Invalid/mismatched compressed payload; drop packet to avoid parser churn.
+                    return
+
         stream_id = header.get("stream_id", 0)
         sn = header.get("sequence_num", 0)
 
-        if stream_id > 0 and stream_id in self.closed_streams:
-            if ptype == Packet_Type.STREAM_FIN:
-                await self._client_enqueue_tx(0, stream_id, sn, b"", is_fin_ack=True)
-                return
-            elif ptype == Packet_Type.STREAM_RST:
-                await self._client_enqueue_tx(0, stream_id, sn, b"", is_rst_ack=True)
-                return
-            elif ptype in (
-                Packet_Type.STREAM_DATA,
-                Packet_Type.STREAM_RESEND,
-                Packet_Type.STREAM_DATA_ACK,
-            ):
-                await self._client_enqueue_tx(
-                    0, stream_id, 0, b"RST:" + os.urandom(4), is_rst=True
+        if await self._handle_closed_stream_packet(ptype, stream_id, sn):
+            return
+
+        stream_data = self.active_streams.get(stream_id) if stream_id > 0 else None
+        stream_id_exists = stream_data is not None
+        if stream_id_exists:
+            stream_data["last_activity_time"] = time.monotonic()
+
+        if ptype == Packet_Type.PACKED_CONTROL_BLOCKS and data:
+            _unpack_from = self._block_packer.unpack_from
+            block_tasks = []
+            block_size = self._block_packer.size
+            for i in range(0, len(data), block_size):
+                if i + block_size > len(data):
+                    break
+                b_ptype, b_stream_id, b_sn = _unpack_from(data, i)
+                if b_ptype not in self._valid_packet_types:
+                    continue
+                block_tasks.append(
+                    self._handle_server_response(
+                        {
+                            "packet_type": b_ptype,
+                            "session_id": self.session_id,
+                            "stream_id": b_stream_id,
+                            "sequence_num": b_sn,
+                        },
+                        b"",
+                    )
                 )
-                return
 
-        stream_id_exists = False
-        if stream_id > 0 and stream_id in self.active_streams:
-            stream_id_exists = True
-            self.active_streams[stream_id]["last_activity_time"] = time.monotonic()
+            # Process packed controls in bounded parallel batches for lower latency.
+            for idx in range(0, len(block_tasks), 8):
+                await asyncio.gather(
+                    *block_tasks[idx : idx + 8],
+                    return_exceptions=True,
+                )
 
+            self._send_ping_packet()
+            return
         if ptype == Packet_Type.STREAM_SYN_ACK and stream_id_exists:
-            stream_data = self.active_streams[stream_id]
-
             if stream_data.get("stream") or stream_data.get("status") == "ACTIVE":
                 return
-
             if stream_data.get("stream_creating"):
                 return
 
@@ -2116,10 +2438,8 @@ class MasterDnsVPNClient:
                 return
 
             stream_data["stream_creating"] = True
-
             try:
                 stream_data["status"] = "ACTIVE"
-
                 raw_reader = stream_data["reader"]
                 initial_payload = stream_data.get("initial_payload", b"")
                 wrapped_reader = PrependReader(raw_reader, initial_payload)
@@ -2128,6 +2448,7 @@ class MasterDnsVPNClient:
                     stream_id=stream_id,
                     session_id=self.session_id,
                     enqueue_tx_cb=self._client_enqueue_tx,
+                    enqueue_control_tx_cb=self._client_enqueue_control_tx,
                     reader=wrapped_reader,
                     writer=writer,
                     mtu=self.safe_uplink_mtu,
@@ -2135,109 +2456,110 @@ class MasterDnsVPNClient:
                     window_size=int(self.arq_window_size),
                     rto=float(self.arq_initial_rto),
                     max_rto=float(self.arq_max_rto),
+                    enable_control_reliability=True,
+                    control_rto=float(self.config.get("ARQ_CONTROL_INITIAL_RTO", 0.8)),
+                    control_max_rto=float(self.config.get("ARQ_CONTROL_MAX_RTO", 2.5)),
+                    control_max_retries=int(
+                        self.config.get("ARQ_CONTROL_MAX_RETRIES", 40)
+                    ),
                 )
-
                 stream_data["stream"] = stream
+                stream_data.pop("socks_error_packet", None)
                 self.logger.debug(
                     f"<blue>Stream <cyan>{stream_id}</cyan> Established with server.</blue>"
                 )
             finally:
                 stream_data.pop("stream_creating", None)
-                self._send_ping_packet()
-        elif ptype == Packet_Type.SOCKS5_SYN_ACK and stream_id_exists:
-            stream_data = self.active_streams[stream_id]
-            if "handshake_event" in stream_data:
+            self._send_ping_packet()
+            return
+
+        if ptype in self._control_request_ack_map:
+            ack_ptype = self._control_request_ack_map[ptype]
+            await self._enqueue_packet(0, stream_id, sn, ack_ptype, b"")
+            if self._is_socks5_error_packet(ptype) and stream_id_exists:
+                stream_data["socks_error_packet"] = ptype
+                if "handshake_event" in stream_data:
+                    stream_data["handshake_event"].set()
+            self._send_ping_packet()
+            return
+
+        if ptype in self._control_ack_types and stream_id_exists:
+            arq = stream_data.get("stream")
+            if arq:
+                await arq.receive_control_ack(ptype, sn)
+            if ptype == Packet_Type.SOCKS5_SYN_ACK and "handshake_event" in stream_data:
                 stream_data["handshake_event"].set()
             self._send_ping_packet()
-        elif (
+            return
+
+        if (
             ptype in (Packet_Type.STREAM_DATA, Packet_Type.STREAM_RESEND)
             and stream_id_exists
             and data
         ):
-            stream_obj = self.active_streams[stream_id].get("stream")
-            if stream_obj:
-                await stream_obj.receive_data(sn, data)
-            self._send_ping_packet()
-        elif ptype == Packet_Type.STREAM_DATA_ACK and stream_id_exists:
-            stream_obj = self.active_streams[stream_id].get("stream")
-            if stream_obj:
-                await stream_obj.receive_ack(sn)
-            self._send_ping_packet()
-        elif ptype == Packet_Type.STREAM_FIN and stream_id_exists:
-            self._send_ping_packet()
-            stream_data = self.active_streams[stream_id]
             arq = stream_data.get("stream")
-            if (
-                arq
-                and getattr(arq, "_fin_sent", False)
-                and getattr(arq, "_fin_acked", False)
-            ):
-                stream_data["fin_retries"] = 99
+            if arq:
+                await arq.receive_data(sn, data)
+            self._send_ping_packet()
+            return
 
-            if (
-                stream_data.get("status") in ("CLOSING", "TIME_WAIT")
-                or not arq
-                or getattr(arq, "closed", False)
-            ):
-                await self._client_enqueue_tx(0, stream_id, sn, b"", is_fin_ack=True)
+        if ptype == Packet_Type.STREAM_DATA_ACK and stream_id_exists:
+            arq = stream_data.get("stream")
+            if arq:
+                await arq.receive_ack(sn)
+            self._send_ping_packet()
+            return
+
+        if ptype == Packet_Type.STREAM_FIN and stream_id_exists:
+            arq = stream_data.get("stream")
+            if not arq or getattr(arq, "closed", False):
+                await self._enqueue_packet(
+                    0, stream_id, sn, Packet_Type.STREAM_FIN_ACK, b""
+                )
                 return
 
-            arq._fin_received = True
-            arq._fin_seq_received = sn
+            if getattr(arq, "_fin_sent", False) and getattr(arq, "_fin_acked", False):
+                stream_data["fin_retries"] = 99
+
+            arq.mark_fin_received(sn)
             await arq._try_finalize_remote_eof()
-
-        elif ptype == Packet_Type.STREAM_FIN_ACK and stream_id_exists:
-            arq = self.active_streams[stream_id].get("stream")
-            if arq and arq._fin_seq_sent == sn:
-                arq._fin_acked = True
-                if arq._fin_received:
-                    await arq._try_finalize_remote_eof()
-
-        elif ptype == Packet_Type.STREAM_RST and stream_id_exists:
             self._send_ping_packet()
-            await self._client_enqueue_tx(0, stream_id, sn, b"", is_rst_ack=True)
+            return
 
-            arq = self.active_streams[stream_id].get("stream")
+        if ptype == Packet_Type.STREAM_FIN_ACK and stream_id_exists:
+            arq = stream_data.get("stream")
             if arq:
-                arq._rst_received = True
-                arq._rst_seq_received = sn
+                await arq.receive_control_ack(Packet_Type.STREAM_FIN_ACK, sn)
+                if getattr(arq, "_fin_received", False):
+                    await arq._try_finalize_remote_eof()
+            self._send_ping_packet()
+            return
 
+        if ptype == Packet_Type.STREAM_RST and stream_id_exists:
+            await self._enqueue_packet(
+                0, stream_id, sn, Packet_Type.STREAM_RST_ACK, b""
+            )
+            arq = stream_data.get("stream")
+            if arq:
+                arq.mark_rst_received(sn)
             await self.close_stream(
                 stream_id,
                 reason="Remote stream reset",
                 abortive=True,
                 remote_reset=True,
             )
-        elif ptype == Packet_Type.STREAM_RST_ACK and stream_id_exists:
-            arq = self.active_streams[stream_id].get("stream")
-            if arq and getattr(arq, "_rst_seq_sent", None) == sn:
-                arq._rst_acked = True
-                self.active_streams[stream_id]["rst_retries"] = 99
             self._send_ping_packet()
-        elif ptype == Packet_Type.PACKED_CONTROL_BLOCKS and data:
-            _unpack_from = struct.unpack_from
-            for i in range(0, len(data), 5):
-                if i + 5 > len(data):
-                    break
-                b_ptype, b_stream_id, b_sn = _unpack_from(">BHH", data, i)
+            return
 
-                if (
-                    b_ptype == Packet_Type.STREAM_DATA_ACK
-                    and b_stream_id in self.active_streams
-                ):
-                    stream_obj = self.active_streams[b_stream_id].get("stream")
-                    if stream_obj:
-                        await stream_obj.receive_ack(b_sn)
-                elif (
-                    b_ptype == Packet_Type.SOCKS5_SYN_ACK
-                    and b_stream_id in self.active_streams
-                ):
-                    stream_data = self.active_streams[b_stream_id]
-                    if "handshake_event" in stream_data:
-                        stream_data["handshake_event"].set()
-                    self._send_ping_packet()
+        if ptype == Packet_Type.STREAM_RST_ACK and stream_id_exists:
+            arq = stream_data.get("stream")
+            if arq:
+                await arq.receive_control_ack(Packet_Type.STREAM_RST_ACK, sn)
+            stream_data["rst_retries"] = 99
             self._send_ping_packet()
-        elif ptype == Packet_Type.ERROR_DROP:
+            return
+
+        if ptype == Packet_Type.ERROR_DROP:
             if not self.session_restart_event.is_set():
                 self.logger.error(
                     "<red>Session dropped by server (Server Restarted or Invalid). Reconnecting...</red>"
@@ -2287,7 +2609,7 @@ class MasterDnsVPNClient:
         stream_data["status"] = "CLOSING"
         self.closed_streams[stream_id] = time.monotonic()
 
-        if len(self.closed_streams) > 1000:
+        if len(self.closed_streams) > self.max_closed_stream_records:
             self.closed_streams.pop(next(iter(self.closed_streams)))
 
         self.logger.debug(
@@ -2315,13 +2637,14 @@ class MasterDnsVPNClient:
         pending_tx = stream_data.get("tx_queue", [])
         if pending_tx:
             for item in pending_tx:
-                if item[2] in (
-                    Packet_Type.STREAM_FIN,
-                    Packet_Type.STREAM_FIN_ACK,
-                    Packet_Type.STREAM_RST,
-                    Packet_Type.STREAM_DATA_ACK,
+                ptype = int(item[2])
+                if (
+                    ptype in self._packable_control_types
+                    and ptype != Packet_Type.SOCKS5_SYN
                 ):
                     heapq.heappush(self.main_queue, item)
+                    self._inc_priority_counter(self.__dict__, item[0])
+                    self._dec_priority_counter(stream_data, item[0])
             self.tx_event.set()
 
         try:
@@ -2331,6 +2654,7 @@ class MasterDnsVPNClient:
             stream_data.get("track_ack", set()).clear()
             stream_data.get("track_fin", set()).clear()
             stream_data.get("track_syn_ack", set()).clear()
+            stream_data.get("priority_counts", {}).clear()
             stream_data["status"] = "TIME_WAIT"
             stream_data["close_time"] = time.monotonic()
         except Exception:
@@ -2354,7 +2678,9 @@ class MasterDnsVPNClient:
                         s["last_activity_time"] = now
                         self.track_types.discard(Packet_Type.STREAM_SYN)
                         syn_data = b"SY:" + os.urandom(4)
-                        await self._client_enqueue_tx(0, sid, 0, syn_data)
+                        await self._enqueue_packet(
+                            0, sid, 0, Packet_Type.STREAM_SYN, syn_data
+                        )
 
                     elif status == "TIME_WAIT":
                         stream_obj = s.get("stream")
@@ -2364,6 +2690,9 @@ class MasterDnsVPNClient:
 
                         elif (
                             stream_obj
+                            and not getattr(
+                                stream_obj, "enable_control_reliability", False
+                            )
                             and getattr(stream_obj, "_rst_sent", False)
                             and not getattr(stream_obj, "_rst_acked", False)
                             and (now - last_act) > 1.5
@@ -2383,7 +2712,15 @@ class MasterDnsVPNClient:
                                 )
 
                         elif (
-                            not (stream_obj and getattr(stream_obj, "_rst_sent", False))
+                            not (
+                                stream_obj
+                                and getattr(
+                                    stream_obj, "enable_control_reliability", False
+                                )
+                            )
+                            and not (
+                                stream_obj and getattr(stream_obj, "_rst_sent", False)
+                            )
                             and not (
                                 stream_obj
                                 and getattr(stream_obj, "_rst_received", False)
@@ -2450,14 +2787,6 @@ class MasterDnsVPNClient:
                         self.logger.debug(
                             f"Error closing stream {sid} in retransmit worker: {e}"
                         )
-
-                for sid, s in list(self.active_streams.items()):
-                    arq = s.get("stream")
-                    if arq and hasattr(arq, "check_retransmits"):
-                        try:
-                            await arq.check_retransmits()
-                        except Exception as _:
-                            pass
 
             except asyncio.CancelledError:
                 break
