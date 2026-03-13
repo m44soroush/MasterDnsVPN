@@ -1,0 +1,308 @@
+name: Build Test (Cython + Onefile, No Release)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Test (matrix)
+    runs-on: ${{ matrix.os }}
+    env:
+      CODE_SIGN_CERT: ${{ secrets.CODE_SIGN_CERT }}
+      CODE_SIGN_CERT_PASSWORD: ${{ secrets.CODE_SIGN_CERT_PASSWORD }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: Windows
+            arch: amd64
+            ext: .exe
+          - os: ubuntu-22.04
+            platform: Linux
+            arch: amd64
+            ext: ""
+          - os: ubuntu-latest
+            platform: Linux-Legacy
+            arch: amd64
+            ext: ""
+          - os: ubuntu-24.04-arm
+            platform: Linux
+            arch: arm64
+            ext: ""
+          - os: macos-latest
+            platform: MacOS
+            arch: arm64
+            ext: ""
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python (Host)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies (Host)
+        if: ${{ matrix.platform != 'Linux-Legacy' }}
+        run: |
+          pip install --upgrade pip
+          pip install pyinstaller cython
+          pip install -r requirements.txt
+          pip check
+
+      - name: Generate launcher entry files (Windows)
+        if: ${{ matrix.os == 'windows-latest' }}
+        shell: powershell
+        run: |
+          @'
+          from pathlib import Path
+          Path("build_client_entry.py").write_text(
+              "from client import main\n\nif __name__ == '__main__':\n    main()\n",
+              encoding="utf-8",
+          )
+          Path("build_server_entry.py").write_text(
+              "from server import main\n\nif __name__ == '__main__':\n    main()\n",
+              encoding="utf-8",
+          )
+          Path("build_verify_extensions.py").write_text(
+              "import importlib\n\nmodules = [\n    'client',\n    'server',\n    'dns_utils.ARQ',\n    'dns_utils.DnsPacketParser',\n    'dns_utils.DNSBalancer',\n    'dns_utils.compression',\n    'dns_utils.config_loader',\n    'dns_utils.DNS_ENUMS',\n]\n\nbad = []\nfor name in modules:\n    mod = importlib.import_module(name)\n    path = (getattr(mod, '__file__', '') or '').lower()\n    print(f'{name} -> {path}')\n    if not (path.endswith('.so') or path.endswith('.pyd')):\n        bad.append((name, path))\n\nif bad:\n    print('Expected compiled extension load, but got:')\n    for name, path in bad:\n        print(f'  {name}: {path}')\n    raise SystemExit(1)\n",
+              encoding="utf-8",
+          )
+          '@ | python -
+
+      - name: Generate launcher entry files (non-Windows)
+        if: ${{ matrix.os != 'windows-latest' }}
+        shell: bash
+        run: |
+          cat > build_client_entry.py <<'PY'
+          from client import main
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          cat > build_server_entry.py <<'PY'
+          from server import main
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          cat > build_verify_extensions.py <<'PY'
+          import importlib
+
+          modules = [
+              "client",
+              "server",
+              "dns_utils.ARQ",
+              "dns_utils.DnsPacketParser",
+              "dns_utils.DNSBalancer",
+              "dns_utils.compression",
+              "dns_utils.config_loader",
+              "dns_utils.DNS_ENUMS",
+          ]
+
+          bad = []
+          for name in modules:
+              mod = importlib.import_module(name)
+              path = (getattr(mod, "__file__", "") or "").lower()
+              print(f"{name} -> {path}")
+              if not (path.endswith(".so") or path.endswith(".pyd")):
+                  bad.append((name, path))
+
+          if bad:
+              print("Expected compiled extension load, but got:")
+              for name, path in bad:
+                  print(f"  {name}: {path}")
+              raise SystemExit(1)
+          PY
+
+      - name: Prepare build directory (Windows)
+        if: ${{ matrix.os == 'windows-latest' }}
+        shell: powershell
+        run: |
+          Remove-Item -LiteralPath dist -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+
+      - name: Prepare build directory (non-Windows)
+        if: ${{ matrix.os != 'windows-latest' }}
+        shell: bash
+        run: |
+          rm -rf dist || true
+          mkdir -p dist
+
+      - name: Compile Python modules to C extensions (Host)
+        if: ${{ matrix.platform != 'Linux-Legacy' }}
+        run: |
+          python build_setup.py build_ext --inplace
+
+      - name: Verify compiled modules are loaded (Host)
+        if: ${{ matrix.platform != 'Linux-Legacy' }}
+        run: |
+          python build_verify_extensions.py
+
+      - name: Build client (Host)
+        if: ${{ matrix.platform != 'Linux-Legacy' }}
+        run: |
+          pyinstaller --onefile --icon=assets/masterdnsvpn.ico --name "MasterDnsVPN_Client_${{ matrix.platform }}_${{ matrix.arch }}" build_client_entry.py
+
+      - name: Build server (Host)
+        if: ${{ matrix.platform != 'Linux-Legacy' }}
+        run: |
+          pyinstaller --onefile --icon=assets/masterdnsvpn.ico --name "MasterDnsVPN_Server_${{ matrix.platform }}_${{ matrix.arch }}" build_server_entry.py
+
+      - name: Build client & server (Linux-Legacy via Docker, with Cython)
+        if: ${{ matrix.platform == 'Linux-Legacy' }}
+        shell: bash
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/work" -w /work python:3.11-bullseye bash -c "
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential
+          pip install pyinstaller cython
+          pip install -r requirements.txt
+          pip check
+          python build_setup.py build_ext --inplace
+          python build_verify_extensions.py
+          pyinstaller --onefile --icon=assets/masterdnsvpn.ico --name 'MasterDnsVPN_Client_${{ matrix.platform }}_${{ matrix.arch }}' build_client_entry.py
+          pyinstaller --onefile --icon=assets/masterdnsvpn.ico --name 'MasterDnsVPN_Server_${{ matrix.platform }}_${{ matrix.arch }}' build_server_entry.py
+          chown -R \$(id -u):\$(id -g) dist/ build/ *.spec || true
+          "
+
+      - name: Bundle config templates with executables
+        shell: bash
+        run: |
+          cp client_config.toml.simple dist/client_config.toml || true
+          cp client_resolvers.simple.txt dist/client_resolvers.txt || true
+          cp server_config.toml.simple dist/server_config.toml || true
+
+      - name: Package artifacts (Windows)
+        if: ${{ matrix.os == 'windows-latest' }}
+        shell: powershell
+        run: |
+          Set-StrictMode -Version Latest
+          Set-Location dist
+          $platform = '${{ matrix.platform }}'
+          $arch = '${{ matrix.arch }}'
+          $ext = '${{ matrix.ext }}'
+          $archUpper = $arch.ToUpper()
+
+          $clientZipBase = "MasterDnsVPN_Client_${platform}_$archUpper"
+          $serverZipBase = "MasterDnsVPN_Server_${platform}_$archUpper"
+
+          $clientOrig = "MasterDnsVPN_Client_${{ matrix.platform }}_${{ matrix.arch }}${{ matrix.ext }}"
+          $serverOrig = "MasterDnsVPN_Server_${{ matrix.platform }}_${{ matrix.arch }}${{ matrix.ext }}"
+
+          $clientExeName = "${clientZipBase}${ext}"
+          $serverExeName = "${serverZipBase}${ext}"
+
+          if (Test-Path $clientOrig) {
+            Rename-Item -Path $clientOrig -NewName $clientExeName -Force
+          }
+          if (Test-Path $serverOrig) {
+            Rename-Item -Path $serverOrig -NewName $serverExeName -Force
+          }
+
+          Compress-Archive -Path $clientExeName,"client_config.toml","client_resolvers.txt" -DestinationPath "${clientZipBase}.zip" -Force
+          Compress-Archive -Path $serverExeName,"server_config.toml" -DestinationPath "${serverZipBase}.zip" -Force
+
+      - name: Package artifacts (non-Windows)
+        if: ${{ matrix.os != 'windows-latest' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          ARCH_UPPER=$(echo "${{ matrix.arch }}" | tr '[:lower:]' '[:upper:]')
+          PLATFORM="${{ matrix.platform }}"
+
+          CLIENT_ZIP_BASE="MasterDnsVPN_Client_${PLATFORM}_${ARCH_UPPER}"
+          SERVER_ZIP_BASE="MasterDnsVPN_Server_${PLATFORM}_${ARCH_UPPER}"
+
+          CLIENT_EXE_NAME="${CLIENT_ZIP_BASE}${{ matrix.ext }}"
+          SERVER_EXE_NAME="${SERVER_ZIP_BASE}${{ matrix.ext }}"
+
+          CLIENT_ORIG="MasterDnsVPN_Client_${{ matrix.platform }}_${{ matrix.arch }}${{ matrix.ext }}"
+          SERVER_ORIG="MasterDnsVPN_Server_${{ matrix.platform }}_${{ matrix.arch }}${{ matrix.ext }}"
+
+          if [ -f "${CLIENT_ORIG}" ]; then
+            mv "${CLIENT_ORIG}" "${CLIENT_EXE_NAME}" || true
+          fi
+          if [ -f "${SERVER_ORIG}" ]; then
+            mv "${SERVER_ORIG}" "${SERVER_EXE_NAME}" || true
+          fi
+
+          CLIENT_ZIP="${CLIENT_ZIP_BASE}.zip"
+          SERVER_ZIP="${SERVER_ZIP_BASE}.zip"
+          CLIENT_TAR="${CLIENT_ZIP_BASE}.tar.gz"
+          SERVER_TAR="${SERVER_ZIP_BASE}.tar.gz"
+
+          CLIENT_TOML="client_config.toml"
+          CLIENT_RESOLVERS="client_resolvers.txt"
+          SERVER_TOML="server_config.toml"
+
+          zip -j "${CLIENT_ZIP}" "${CLIENT_EXE_NAME}" "${CLIENT_TOML}" "${CLIENT_RESOLVERS}" || true
+          tar -czf "${CLIENT_TAR}" "${CLIENT_EXE_NAME}" "${CLIENT_TOML}" "${CLIENT_RESOLVERS}" || true
+          zip -j "${SERVER_ZIP}" "${SERVER_EXE_NAME}" "${SERVER_TOML}" || true
+          tar -czf "${SERVER_TAR}" "${SERVER_EXE_NAME}" "${SERVER_TOML}" || true
+
+      - name: Code sign Windows executables (optional)
+        if: ${{ env.CODE_SIGN_CERT != '' && matrix.os == 'windows-latest' }}
+        shell: powershell
+        env:
+          CODE_SIGN_CERT: ${{ secrets.CODE_SIGN_CERT }}
+          CODE_SIGN_CERT_PASSWORD: ${{ secrets.CODE_SIGN_CERT_PASSWORD }}
+        run: |
+          Write-Host "Decoding CODE_SIGN_CERT to cert.pfx"
+          [System.IO.File]::WriteAllBytes('cert.pfx', [Convert]::FromBase64String('${{ env.CODE_SIGN_CERT }}'))
+          if (Test-Path 'cert.pfx') {
+            $signtool = Get-Command signtool.exe -ErrorAction SilentlyContinue
+            if ($null -ne $signtool) {
+              Write-Host "signtool found at $($signtool.Path). Signing files..."
+              $files = Get-ChildItem -Path .\ -Filter "*Windows*amd64*${{ matrix.ext }}*" -Recurse -File
+              foreach ($f in $files) {
+                Write-Host "Signing $($f.FullName)"
+                & $signtool.Path sign /f cert.pfx /p "${{ env.CODE_SIGN_CERT_PASSWORD }}" /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $f.FullName
+              }
+            } else { Write-Host "signtool not found on runner; skipping Windows signing." }
+          } else { Write-Host "cert.pfx not found after decode; skipping signing." }
+
+      - name: Code sign macOS executables (optional)
+        if: ${{ env.CODE_SIGN_CERT != '' && startsWith(matrix.os, 'macos') }}
+        shell: bash
+        env:
+          CODE_SIGN_CERT: ${{ secrets.CODE_SIGN_CERT }}
+          CODE_SIGN_CERT_PASSWORD: ${{ secrets.CODE_SIGN_CERT_PASSWORD }}
+        run: |
+          echo "Decoding CODE_SIGN_CERT to cert.pfx"
+          echo "${{ env.CODE_SIGN_CERT }}" | base64 -d > cert.pfx
+          if [ -f cert.pfx ]; then
+            echo "Importing cert.pfx into login keychain (may require interactive access)"
+            security import cert.pfx -k ~/Library/Keychains/login.keychain -P "${{ env.CODE_SIGN_CERT_PASSWORD }}" -T /usr/bin/codesign || true
+            IDENTITY=$(security find-identity -v -p codesigning | head -n1 | awk -F '"' '{print $2}') || true
+            if [ -n "$IDENTITY" ]; then
+              echo "Found identity: $IDENTITY. Signing macOS binaries."
+              for f in ./dist/*${{ matrix.platform }}*${{ matrix.arch }}*; do
+                if [ -f "$f" ] && [[ "$f" != *.* ]]; then
+                  codesign --sign "$IDENTITY" --options runtime --timestamp --force "$f" || true
+                fi
+              done
+            else
+              echo "No signing identity found; skipping codesign."
+            fi
+          else
+            echo "cert.pfx not present; skipping macOS signing."
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-test-cython-${{ matrix.platform }}-${{ matrix.arch }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
