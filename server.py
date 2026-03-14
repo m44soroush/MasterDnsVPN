@@ -242,6 +242,7 @@ class MasterDnsVPNServer(PacketQueueMixin):
         # Heavy packet handlers are deferred to background tasks so DNS responses
         # can be returned immediately from queue without waiting on local I/O.
         self._deferred_handler_packet_types = {
+            Packet_Type.STREAM_SYN,
             Packet_Type.SOCKS5_SYN,
             Packet_Type.STREAM_DATA,
             Packet_Type.STREAM_RESEND,
@@ -417,6 +418,10 @@ class MasterDnsVPNServer(PacketQueueMixin):
             now = time.monotonic()
 
             self.sessions[session_id] = {
+                "session_id": session_id,
+                "session_cookie": random.randint(
+                    0, 255
+                ),  # TODO: IMPLEMENT PROPER SESSION COOKIE GENERATION
                 "created_at": now,
                 "last_packet_time": now,
                 "init_token": client_token,
@@ -833,10 +838,7 @@ class MasterDnsVPNServer(PacketQueueMixin):
         self, session_id, stream_id, sn, labels, extracted_header, now_mono
     ):
         """Handle STREAM_SYN packets without blocking current response."""
-        if self.loop:
-            self._spawn_background_task(
-                self._handle_stream_syn(session_id, stream_id, sn)
-            )
+        await self._handle_stream_syn(session_id, stream_id, sn)
 
     def _map_socks5_rep_to_packet(self, rep_code: int) -> int:
         """Map SOCKS5 REP code to Packet_Type."""
@@ -2215,7 +2217,12 @@ class MasterDnsVPNServer(PacketQueueMixin):
 
         if stream_id in session.get("closed_streams", {}):
             await self._enqueue_packet(
-                session_id, 1, stream_id, 0, Packet_Type.STREAM_FIN, b""
+                session_id,
+                1,
+                stream_id,
+                0,
+                Packet_Type.STREAM_RST,
+                b"RST:" + os.urandom(4),
             )
             return
 
