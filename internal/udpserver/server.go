@@ -59,6 +59,12 @@ type Server struct {
 	dialStreamUpstreamFn    func(string, string, time.Duration) (net.Conn, error)
 	uploadCompressionMask   uint8
 	downloadCompressionMask uint8
+	dropLogIntervalNanos    int64
+	invalidCookieWindow     time.Duration
+	invalidCookieThreshold  int
+	socksConnectTimeout     time.Duration
+	streamOutboundTTL       time.Duration
+	streamOutboundMaxRetry  int
 	packetPool              sync.Pool
 	droppedPackets          atomic.Uint64
 	lastDropLogUnix         atomic.Int64
@@ -98,6 +104,12 @@ func New(cfg config.ServerConfig, log *logger.Logger, codec *security.Codec) *Se
 		},
 		uploadCompressionMask:   buildCompressionMask(cfg.SupportedUploadCompressionTypes),
 		downloadCompressionMask: buildCompressionMask(cfg.SupportedDownloadCompressionTypes),
+		dropLogIntervalNanos:    cfg.DropLogInterval().Nanoseconds(),
+		invalidCookieWindow:     cfg.InvalidCookieWindow(),
+		invalidCookieThreshold:  cfg.InvalidCookieErrorThreshold,
+		socksConnectTimeout:     cfg.SOCKSConnectTimeout(),
+		streamOutboundTTL:       cfg.StreamOutboundTTL(),
+		streamOutboundMaxRetry:  cfg.StreamOutboundMaxRetries,
 		packetPool: sync.Pool{
 			New: func() any {
 				return make([]byte, cfg.MaxPacketSize)
@@ -358,8 +370,8 @@ func (s *Server) handleTunnelCandidate(packet []byte, parsed DnsParser.LitePacke
 				vpnPacket.SessionCookie,
 				lookup.State,
 				now,
-				s.cfg.InvalidCookieWindow(),
-				s.cfg.InvalidCookieErrorThreshold,
+				s.invalidCookieWindow,
+				s.invalidCookieThreshold,
 			)
 			if shouldEmit {
 				if hasExpectedCookie && lookup.State == sessionLookupClosed {
@@ -544,7 +556,7 @@ func (s *Server) onDrop(addr *net.UDPAddr) {
 
 	now := logger.NowUnixNano()
 	last := s.lastDropLogUnix.Load()
-	interval := s.cfg.DropLogInterval().Nanoseconds()
+	interval := s.dropLogIntervalNanos
 	if interval <= 0 {
 		interval = 2_000_000_000
 	}
@@ -863,7 +875,11 @@ func (s *Server) dialSOCKSStreamTarget(host string, port uint16) (net.Conn, erro
 			return net.DialTimeout(network, address, timeout)
 		}
 	}
-	return dialFn("tcp", net.JoinHostPort(host, strconv.Itoa(int(port))), s.cfg.SOCKSConnectTimeout())
+	timeout := s.socksConnectTimeout
+	if timeout <= 0 {
+		timeout = s.cfg.SOCKSConnectTimeout()
+	}
+	return dialFn("tcp", net.JoinHostPort(host, strconv.Itoa(int(port))), timeout)
 }
 
 func (s *Server) mapSOCKSConnectError(err error) uint8 {
@@ -1003,7 +1019,8 @@ func (s *Server) handleStreamRSTRequest(questionPacket []byte, decision domainMa
 	if sessionRecord == nil {
 		return nil
 	}
-	_ = s.streams.MarkReset(vpnPacket.SessionID, vpnPacket.StreamID, vpnPacket.SequenceNum, time.Now())
+	now := time.Now()
+	_ = s.streams.MarkReset(vpnPacket.SessionID, vpnPacket.StreamID, vpnPacket.SequenceNum, now)
 	s.streamOutbound.ClearStream(vpnPacket.SessionID, vpnPacket.StreamID)
 	return s.buildSessionVPNResponse(questionPacket, decision.RequestName, sessionRecord, VpnProto.Packet{
 		PacketType:  Enums.PACKET_STREAM_RST_ACK,
@@ -1043,7 +1060,7 @@ func (s *Server) expireStalledOutboundStreams(sessionID uint8, now time.Time) {
 	if s == nil {
 		return
 	}
-	expired := s.streamOutbound.ExpireStalled(sessionID, now, s.cfg.StreamOutboundMaxRetries, s.cfg.StreamOutboundTTL())
+	expired := s.streamOutbound.ExpireStalled(sessionID, now, s.streamOutboundMaxRetry, s.streamOutboundTTL)
 	for _, streamID := range expired {
 		sequenceNum, ok := s.streams.NextOutboundSequence(sessionID, streamID, now)
 		if !ok {
