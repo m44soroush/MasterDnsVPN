@@ -115,6 +115,12 @@ func (c *Client) dispatchServerPacket(packet VpnProto.Packet, timeout time.Durat
 		return result, nil
 	}
 
+	if packet.PacketType != 0 && packet.PacketType != Enums.PACKET_PONG {
+		if c.stream0Runtime != nil {
+			c.stream0Runtime.noteServerDataActivity()
+		}
+	}
+
 	if sent != nil && matchesQueuedPacketAck(*sent, packet.PacketType, packet.StreamID, packet.SequenceNum, packet.FragmentID, packet.TotalFragments) {
 		result.ackedQueued = true
 	}

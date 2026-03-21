@@ -30,7 +30,10 @@ func (c *Client) localDNSFragmentTimeout() time.Duration {
 }
 
 func (c *Client) hasPendingDNSWork() bool {
-	return c != nil && c.localDNSCache != nil && c.localDNSCache.HasPending()
+	if c == nil || c.stream0Runtime == nil {
+		return false
+	}
+	return c.stream0Runtime.hasPendingDNSRequests()
 }
 
 func (c *Client) queueDNSDispatch(request *dnsDispatchRequest) {

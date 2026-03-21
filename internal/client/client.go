@@ -879,10 +879,13 @@ func clientStreamQuiescent(stream *clientStream) bool {
 		return false
 	}
 	if stream.ResetSent {
-		return false
+		return true
 	}
-	if stream.LocalFinSent || stream.RemoteFinRecv {
-		return stream.LocalFinAcked && stream.RemoteFinRecv
+	if stream.LocalFinSent {
+		return true
+	}
+	if stream.RemoteFinRecv {
+		return true
 	}
 	return false
 }

@@ -26,17 +26,18 @@ var (
 	stream0DNSRetryMaxDelay        = 2 * time.Second
 	stream0DNSOnlyWarmDuration     = 30 * time.Second
 	stream0DNSOnlyWarmPingInterval = time.Second
-	stream0PingIdleHighThreshold   = 10 * time.Second
-	stream0PingIdleMediumThreshold = 5 * time.Second
-	stream0DNSOnlyPingInterval     = 10 * time.Second
-	stream0PingHighIdleInterval    = 3 * time.Second
-	stream0PingMediumIdleInterval  = time.Second
-	stream0PingBusyInterval        = 200 * time.Millisecond
-	stream0DNSOnlyWarmMaxSleep     = 500 * time.Millisecond
-	stream0PingDNSOnlyMaxSleep     = time.Second
-	stream0PingHighIdleMaxSleep    = 500 * time.Millisecond
-	stream0PingMediumIdleMaxSleep  = 200 * time.Millisecond
-	stream0PingBusyMaxSleep        = 180 * time.Millisecond
+
+	// Ping Intervals
+	stream0PingBusyInterval = 300 * time.Millisecond // Active stream or DNS in queue
+	stream0PingIdleStep1    = 500 * time.Millisecond // < 5s idle
+	stream0PingIdleStep2    = 3 * time.Second        // < 35s idle
+	stream0PingIdleStep3    = 30 * time.Second       // > 35s idle
+	stream0MaxQueuedPings   = 100
+
+	// Aliases for tests (to avoid breaking client_test.go)
+	stream0DNSOnlyPingInterval = stream0PingIdleStep2
+	stream0DNSOnlyWarmMaxSleep = 200 * time.Millisecond
+	stream0PingDNSOnlyMaxSleep = 500 * time.Millisecond
 )
 
 type stream0DNSRequestState struct {
@@ -68,6 +69,7 @@ type stream0Runtime struct {
 	dnsActivitySeen  atomic.Bool
 	lastDataActivity atomic.Int64 // UnixNano
 	lastPingTime     atomic.Int64 // UnixNano
+	queuedPings      atomic.Int32
 }
 
 func newStream0Runtime(client *Client) *stream0Runtime {
@@ -155,6 +157,7 @@ func (r *stream0Runtime) QueueMainPacket(packet arq.QueuedPacket) bool {
 			r.inFlight.Load(),
 		)
 	}
+	r.lastDataActivity.Store(time.Now().UnixNano())
 	r.notifyWake()
 	return true
 }
@@ -223,7 +226,7 @@ func (r *stream0Runtime) QueuePing() bool {
 	if r == nil || !r.IsRunning() || r.client == nil || !r.client.SessionReady() {
 		return false
 	}
-	if r.pendingPings() > 0 {
+	if int(r.queuedPings.Load()) >= stream0MaxQueuedPings {
 		return false
 	}
 
@@ -239,6 +242,7 @@ func (r *stream0Runtime) QueuePing() bool {
 	}) {
 		return false
 	}
+	r.queuedPings.Add(1)
 	if r.client != nil && r.client.log != nil {
 		r.client.log.Debugf(
 			"🏓 <blue>Queued Poll Ping | InFlight: <cyan>%d</cyan></blue>",
@@ -272,6 +276,7 @@ func (r *stream0Runtime) QueueStreamPacket(streamID uint16, packetType uint8, se
 			r.inFlight.Load(),
 		)
 	}
+	r.lastDataActivity.Store(time.Now().UnixNano())
 	r.notifyWake()
 	return true
 }
@@ -365,67 +370,38 @@ func (r *stream0Runtime) nextPingSchedule(now time.Time) (bool, time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	hasPendingDNS := r.client != nil && r.client.hasPendingDNSWork()
-	activeStreams := 0
-	hasStreamTXWork := false
-	hasControlWork := false
-	if r.client != nil {
-		activeStreams = r.client.activeStreamCount()
-		hasStreamTXWork = r.client.hasActiveStreamTXWork()
-		hasControlWork = r.client.hasPendingStreamControlWork()
-	}
-
 	lastPingTime := time.Unix(0, r.lastPingTime.Load())
 	lastDataActivity := time.Unix(0, r.lastDataActivity.Load())
-	timeSinceLastPing := now.Sub(lastPingTime)
 	idleTime := now.Sub(lastDataActivity)
 
-	// Default: 30s keep-alive for everything
-	pingInterval := 30 * time.Second
-	maxSleep := time.Second
-
-	// Context-aware interval optimization
-	if activeStreams > 0 || hasControlWork {
-		if hasStreamTXWork {
-			pingInterval = 80 * time.Millisecond
-			maxSleep = 50 * time.Millisecond
-		} else if hasControlWork {
-			pingInterval = 100 * time.Millisecond
-			maxSleep = 60 * time.Millisecond
-		} else if !r.dnsActivitySeen.Load() {
-			// Session is active but no DNS traffic yet, ping slowly but consistently
-			pingInterval = 2 * time.Second
-			maxSleep = 250 * time.Millisecond
-		} else if idleTime < stream0PingIdleMediumThreshold {
-			// Very active data flow
-			pingInterval = 120 * time.Millisecond
-			maxSleep = 80 * time.Millisecond
-		} else if idleTime < stream0PingIdleHighThreshold {
-			// Moderate activity
-			pingInterval = 300 * time.Millisecond
-			maxSleep = 120 * time.Millisecond
-		} else {
-			// High idle but still has active streams
-			pingInterval = 750 * time.Millisecond
-			maxSleep = 200 * time.Millisecond
-		}
-	} else if hasPendingDNS {
-		if idleTime < stream0DNSOnlyWarmDuration {
-			// DNS is active and "warm"
-			pingInterval = stream0DNSOnlyWarmPingInterval
-			maxSleep = stream0DNSOnlyWarmMaxSleep
-		} else {
-			// DNS is active but "cold"
-			pingInterval = stream0DNSOnlyPingInterval
-			maxSleep = stream0PingDNSOnlyMaxSleep
-		}
+	activeStreams := 0
+	isBusy := false
+	if r.client != nil {
+		activeStreams = r.client.activeStreamCount()
+		isBusy = activeStreams > 0 || len(r.dnsRequests) > 0 ||
+			r.client.hasActiveStreamTXWork() || r.client.hasPendingStreamControlWork()
+	} else {
+		isBusy = len(r.dnsRequests) > 0
 	}
 
-	// Safety cap at 30s for ALL conditions (Keep-alive)
-	if pingInterval > 30*time.Second {
-		pingInterval = 30 * time.Second
+	var pingInterval time.Duration
+	var maxSleep time.Duration
+
+	if isBusy {
+		pingInterval = stream0PingBusyInterval // 0.3s
+		maxSleep = 180 * time.Millisecond
+	} else if idleTime < 5*time.Second {
+		pingInterval = stream0PingIdleStep1 // 0.5s
+		maxSleep = 200 * time.Millisecond
+	} else if idleTime < 35*time.Second {
+		pingInterval = stream0PingIdleStep2 // 3s
+		maxSleep = 500 * time.Millisecond
+	} else {
+		pingInterval = stream0PingIdleStep3 // 30s
+		maxSleep = time.Second
 	}
 
+	timeSinceLastPing := now.Sub(lastPingTime)
 	if timeSinceLastPing >= pingInterval {
 		return true, pingInterval
 	}
@@ -439,6 +415,9 @@ func (r *stream0Runtime) nextPingSchedule(now time.Time) (bool, time.Duration) {
 
 func (r *stream0Runtime) processDequeue(packet arq.QueuedPacket) {
 	defer arq.FreePayload(packet.Payload)
+	if packet.PacketType == Enums.PACKET_PING {
+		r.queuedPings.Add(-1)
+	}
 
 	if packet.PacketType != Enums.PACKET_PING {
 		sentAt := time.Now()
@@ -503,7 +482,9 @@ func (r *stream0Runtime) processDequeue(packet arq.QueuedPacket) {
 	queuedAcked := false
 	now := time.Now()
 	if response.PacketType != 0 {
-		r.noteServerDataActivity()
+		if response.PacketType != Enums.PACKET_PONG {
+			r.noteServerDataActivity()
+		}
 		dispatch, dispatchErr := r.client.dispatchServerPacket(response, time.Second, &packet)
 		queuedAcked = dispatch.ackedQueued
 		if dispatchErr != nil && !errors.Is(dispatchErr, ErrSessionDropped) && r.client.log != nil {
@@ -763,6 +744,7 @@ func (r *stream0Runtime) failAllPending() {
 	r.mu.Lock()
 	r.dnsRequests = make(map[uint16]*stream0DNSRequestState, 4)
 	r.mu.Unlock()
+	r.queuedPings.Store(0)
 	r.running.Store(false)
 }
 
@@ -778,6 +760,7 @@ func (r *stream0Runtime) ResetForReconnect() {
 	now := time.Now().UnixNano()
 	r.lastDataActivity.Store(now)
 	r.lastPingTime.Store(now)
+	r.queuedPings.Store(0)
 	if r.scheduler != nil {
 		r.schedulerMu.Lock()
 		r.scheduler.HandleSessionReset()
@@ -810,6 +793,15 @@ func (r *stream0Runtime) pendingPings() int {
 	r.schedulerMu.Lock()
 	defer r.schedulerMu.Unlock()
 	return r.scheduler.PendingPings()
+}
+
+func (r *stream0Runtime) hasPendingDNSRequests() bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.dnsRequests) > 0
 }
 
 func (r *stream0Runtime) rescheduleStreamPacket(streamID uint16, sequenceNum uint16) {

@@ -885,13 +885,25 @@ func TestStream0RuntimeUsesSlowPingForPendingDNSOnly(t *testing.T) {
 	c.sessionReady = true
 	c.responseMode = mtuProbeRawResponse
 
-	c.localDNSCache.LookupOrCreatePending(
-		dnscache.BuildKey("example.com", Enums.DNS_RECORD_TYPE_A, Enums.DNSQ_CLASS_IN),
-		"example.com",
-		Enums.DNS_RECORD_TYPE_A,
-		Enums.DNSQ_CLASS_IN,
-		now,
-	)
+	c.stream0Runtime.mu.Lock()
+	runtimeNow := time.Now()
+	c.stream0Runtime.dnsRequests[19] = &stream0DNSRequestState{
+		fragments: map[uint8]*stream0DNSFragmentState{
+			0: {
+				packet: arq.QueuedPacket{
+					PacketType:     Enums.PACKET_DNS_QUERY_REQ,
+					StreamID:       0,
+					SequenceNum:    19,
+					FragmentID:     0,
+					TotalFragments: 1,
+				},
+				createdAt:  runtimeNow,
+				retryAt:    runtimeNow.Add(time.Minute),
+				retryDelay: stream0DNSRetryBaseDelay,
+			},
+		},
+	}
+	c.stream0Runtime.mu.Unlock()
 
 	pingSeen := make(chan struct{}, 1)
 	c.exchangeQueryFn = func(conn Connection, packet []byte, timeout time.Duration) ([]byte, error) {
@@ -2662,6 +2674,71 @@ func TestActiveStreamCountIgnoresQuiescentStream(t *testing.T) {
 
 	if got := c.activeStreamCount(); got != 0 {
 		t.Fatalf("expected quiescent stream to be ignored, got=%d", got)
+	}
+}
+
+func TestActiveStreamCountIgnoresLocalFinDrainedStream(t *testing.T) {
+	c := New(config.ClientConfig{Domains: []string{"a.com"}}, nil, nil)
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+
+	stream := c.createStream(90, clientConn)
+	defer c.deleteStream(stream.ID)
+
+	stream.mu.Lock()
+	stream.LocalFinSent = true
+	stream.LocalFinAcked = false
+	stream.RemoteFinRecv = false
+	stream.TXQueue = nil
+	stream.TXInFlight = nil
+	stream.mu.Unlock()
+
+	if got := c.activeStreamCount(); got != 0 {
+		t.Fatalf("expected drained local-fin stream to be ignored, got=%d", got)
+	}
+}
+
+func TestStream0PingScheduleBacksOffWithoutWork(t *testing.T) {
+	c := New(config.ClientConfig{}, nil, nil)
+	r := c.stream0Runtime
+	now := time.Now()
+
+	r.lastPingTime.Store(now.Add(-3 * time.Second).UnixNano())
+	r.lastDataActivity.Store(now.Add(-3 * time.Second).UnixNano())
+
+	shouldPing, sleepFor := r.nextPingSchedule(now)
+	if shouldPing {
+		t.Fatalf("expected no immediate ping without streams or pending work, sleepFor=%v", sleepFor)
+	}
+	if sleepFor < 400*time.Millisecond {
+		t.Fatalf("expected backed-off sleep without work, got=%v", sleepFor)
+	}
+}
+
+func TestStream0PingScheduleIdleStreamIsNotAggressive(t *testing.T) {
+	c := New(config.ClientConfig{Domains: []string{"a.com"}}, nil, nil)
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+
+	stream := c.createStream(89, clientConn)
+	defer c.deleteStream(stream.ID)
+
+	now := time.Now()
+	stream.mu.Lock()
+	stream.LastActivityAt = now.Add(-12 * time.Second)
+	stream.mu.Unlock()
+	r := c.stream0Runtime
+	r.lastPingTime.Store(now.Add(-500 * time.Millisecond).UnixNano())
+	r.lastDataActivity.Store(now.Add(-12 * time.Second).UnixNano())
+
+	shouldPing, sleepFor := r.nextPingSchedule(now)
+	if shouldPing {
+		t.Fatalf("expected idle stream to avoid immediate aggressive ping, sleepFor=%v", sleepFor)
+	}
+	if sleepFor < 400*time.Millisecond {
+		t.Fatalf("expected idle stream sleep to be backed off, got=%v", sleepFor)
 	}
 }
 
