@@ -22,9 +22,10 @@ const (
 
 type PingManager struct {
 	client                 *Client
-	lastMeaningfulActivity atomic.Int64
 	lastPingSentAt         atomic.Int64
 	lastPongReceivedAt     atomic.Int64
+	lastNonPingSentAt      atomic.Int64
+	lastNonPongReceivedAt  atomic.Int64
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -38,9 +39,10 @@ func newPingManager(client *Client) *PingManager {
 		client: client,
 		wakeCh: make(chan struct{}, 1),
 	}
-	p.lastMeaningfulActivity.Store(now)
 	p.lastPingSentAt.Store(now)
 	p.lastPongReceivedAt.Store(now)
+	p.lastNonPingSentAt.Store(now)
+	p.lastNonPongReceivedAt.Store(now)
 	return p
 }
 
@@ -62,56 +64,60 @@ func (p *PingManager) Stop() {
 	}
 }
 
-func (p *PingManager) NotifyMeaningfulActivity() {
+func (p *PingManager) NotifyPacket(packetType uint8, isInbound bool) {
 	if p == nil {
 		return
 	}
-	p.lastMeaningfulActivity.Store(time.Now().UnixNano())
+	now := time.Now().UnixNano()
+	isPing := packetType == Enums.PACKET_PING
+	isPong := packetType == Enums.PACKET_PONG || packetType == Enums.PACKET_STREAM_DATA_ACK || packetType == Enums.PACKET_STREAM_FIN_ACK || packetType == Enums.PACKET_STREAM_RST_ACK
+
+	if isInbound {
+		if isPong {
+			p.lastPongReceivedAt.Store(now)
+		} else {
+			p.lastNonPongReceivedAt.Store(now)
+			p.wake()
+		}
+	} else {
+		if isPing {
+			p.lastPingSentAt.Store(now)
+		} else {
+			p.lastNonPingSentAt.Store(now)
+			p.wake()
+		}
+	}
+}
+
+func (p *PingManager) wake() {
 	select {
 	case p.wakeCh <- struct{}{}:
 	default:
 	}
 }
 
-func (p *PingManager) NotifyPingSent() {
-	if p == nil {
-		return
-	}
-	p.lastPingSentAt.Store(time.Now().UnixNano())
-}
-
-func (p *PingManager) NotifyPongReceived() {
-	if p == nil {
-		return
-	}
-	p.lastPongReceivedAt.Store(time.Now().UnixNano())
-}
-
-func (p *PingManager) onlyPingPongActive(now time.Time, meaningfulAt time.Time) bool {
-	lastPing := time.Unix(0, p.lastPingSentAt.Load())
-	lastPong := time.Unix(0, p.lastPongReceivedAt.Load())
-	if lastPing.Before(meaningfulAt) || lastPong.Before(meaningfulAt) {
-		return false
-	}
-	if now.Sub(lastPing) > pingPongFreshWindow || now.Sub(lastPong) > pingPongFreshWindow {
-		return false
-	}
-	return true
-}
-
 func (p *PingManager) nextInterval(now time.Time) time.Duration {
-	meaningfulAt := time.Unix(0, p.lastMeaningfulActivity.Load())
-	if !p.onlyPingPongActive(now, meaningfulAt) {
+	lastNonPingSent := time.Unix(0, p.lastNonPingSentAt.Load())
+	lastNonPongRecv := time.Unix(0, p.lastNonPongReceivedAt.Load())
+
+	// Condition: Aggressive if ANY non-ping/pong activity in last 5 seconds
+	if now.Sub(lastNonPingSent) < pingWarmThreshold || now.Sub(lastNonPongRecv) < pingWarmThreshold {
 		return pingAggressiveInterval
 	}
 
-	idleTime := now.Sub(meaningfulAt)
+	// Otherwise, it's been "quiet" (only ping/pong or nothing) for at least 5s
+	// We can use a sliding scale or just lazy
+	idleTimeSinceSent := now.Sub(lastNonPingSent)
+	idleTimeSinceRecv := now.Sub(lastNonPongRecv)
+	minIdle := idleTimeSinceSent
+	if idleTimeSinceRecv < minIdle {
+		minIdle = idleTimeSinceRecv
+	}
+
 	switch {
-	case idleTime < pingWarmThreshold:
-		return pingAggressiveInterval
-	case idleTime < pingCoolThreshold:
+	case minIdle < pingCoolThreshold:
 		return pingLazyInterval
-	case idleTime < pingColdThreshold:
+	case minIdle < pingColdThreshold:
 		return pingCoolDownInterval
 	default:
 		return pingColdInterval
@@ -143,7 +149,6 @@ func (p *PingManager) pingLoop() {
 				payload, err := buildClientPingPayload()
 				if err == nil {
 					p.client.QueueControlPacket(Enums.PACKET_PING, payload)
-					p.NotifyPingSent()
 				}
 			}
 		}

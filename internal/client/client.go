@@ -1059,7 +1059,19 @@ func (c *Client) QueueControlPacket(packetType uint8, payload []byte) {
 	if !ok {
 		return
 	}
+
+	// Discard Ping if queue is already full (100+ packets)
+	if packetType == Enums.PACKET_PING {
+		s.mu.Lock()
+		queueLen := len(s.TXQueue)
+		s.mu.Unlock()
+		if queueLen >= 100 {
+			return
+		}
+	}
+
 	_ = c.queueStreamPacket(s, packetType, payload)
+	c.pingManager.NotifyPacket(packetType, false)
 }
 
 func (c *Client) StartSupportRuntimes(ctx context.Context) {
@@ -1068,4 +1080,7 @@ func (c *Client) StartSupportRuntimes(ctx context.Context) {
 	}
 	c.ensureLocalDNSCachePersistence(ctx)
 	c.startResolverHealthRuntime(ctx)
+	if c.pingManager != nil {
+		c.pingManager.Start(ctx)
+	}
 }

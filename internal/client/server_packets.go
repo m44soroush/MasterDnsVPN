@@ -110,7 +110,7 @@ func (c *Client) dispatchServerPacket(packet VpnProto.Packet, timeout time.Durat
 	}
 
 	if packet.PacketType != 0 && packet.PacketType != Enums.PACKET_PONG {
-		c.pingManager.NotifyMeaningfulActivity()
+		c.pingManager.NotifyPacket(packet.PacketType, true)
 	}
 
 	if sent != nil && matchesQueuedPacketAck(*sent, packet.PacketType, packet.StreamID, packet.SequenceNum, packet.FragmentID, packet.TotalFragments) {

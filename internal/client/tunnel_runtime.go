@@ -54,7 +54,7 @@ func (c *Client) sendQueuedRuntimePacket(packet arq.QueuedPacket) error {
 	}
 
 	if packet.PacketType != Enums.PACKET_PING {
-		c.pingManager.NotifyMeaningfulActivity()
+		c.pingManager.NotifyPacket(packet.PacketType, false)
 	}
 
 	var (

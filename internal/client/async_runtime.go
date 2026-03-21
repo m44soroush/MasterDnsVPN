@@ -8,7 +8,6 @@ import (
 	"time"
 
 	DnsParser "masterdnsvpn-go/internal/dnsparser"
-	Enums "masterdnsvpn-go/internal/enums"
 )
 
 // StopAsyncRuntime stops all running workers (Readers, Writers, Processors).
@@ -218,11 +217,7 @@ func (c *Client) handleInboundPacket(data []byte, addr *net.UDPAddr) {
 		return
 	}
 
-	if vpnPacket.PacketType == Enums.PACKET_PONG {
-		c.pingManager.NotifyPongReceived()
-	} else {
-		c.pingManager.NotifyMeaningfulActivity()
-	}
+	c.pingManager.NotifyPacket(vpnPacket.PacketType, true)
 
 	// 4. Dispatch to Session/Stream handler
 	dispatch, err := c.dispatchServerPacket(vpnPacket, time.Second, nil)
@@ -243,9 +238,7 @@ func (c *Client) handleInboundPacket(data []byte, addr *net.UDPAddr) {
 
 // SendBurstPacket adds a packet to the transmission queue.
 func (c *Client) SendBurstPacket(conn Connection, payload []byte, packetType uint8) {
-	if packetType != Enums.PACKET_PING {
-		c.pingManager.NotifyMeaningfulActivity()
-	}
+	c.pingManager.NotifyPacket(packetType, false)
 	select {
 	case c.txChannel <- asyncPacket{conn: conn, payload: payload, packetType: packetType}:
 	default:
