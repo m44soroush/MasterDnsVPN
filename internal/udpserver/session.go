@@ -24,10 +24,10 @@ import (
 var ErrSessionTableFull = errors.New("session table full")
 
 const (
-	maxServerSessionID    = 255
-	maxServerSessionSlots = 255
-	sessionInitTTL        = 10 * time.Minute
-	sessionInitDataSize   = 10
+	maxServerSessionID          = 255
+	maxServerSessionSlots       = 255
+	sessionInitTTL              = 10 * time.Minute
+	sessionInitDataSize         = 10
 	minSessionMTU               = 30
 	maxSessionMTU               = 4096
 	serverClosedStreamRecordTTL = 45 * time.Second
@@ -62,10 +62,10 @@ type sessionRecord struct {
 	lastActivityUnixNano int64
 
 	// New fields for ARQ refactor
-	Streams       map[uint16]*Stream_server
-	ActiveStreams []uint16 // Sorted list of active stream IDs for Round-Robin
-	RRStreamID    uint16   // Last served stream ID for RR
-	EnqueueSeq    uint64   // Global sequence for FIFO inside same priority
+	Streams        map[uint16]*Stream_server
+	ActiveStreams  []uint16 // Sorted list of active stream IDs for Round-Robin
+	RRStreamID     uint16   // Last served stream ID for RR
+	EnqueueSeq     uint64   // Global sequence for FIFO inside same priority
 	StreamsMu      sync.RWMutex
 	RecentlyClosed map[uint16]time.Time
 }
@@ -119,31 +119,14 @@ func getEffectivePriority(packetType uint8, basePriority int) int {
 }
 
 type sessionRuntimeView struct {
-	ID                   uint8
-	Cookie               uint8
-	ResponseMode         uint8
-	ResponseBase64       bool
-	DownloadCompression  uint8
-	DownloadMTU          uint16
-	DownloadMTUBytes     int
-	MaxPackedBlocks      int
-}
-
-type sessionSnapshot struct {
-	ID                   uint8
-	Cookie               uint8
-	ResponseMode         uint8
-	UploadCompression    uint8
-	DownloadCompression  uint8
-	UploadMTU            uint16
-	DownloadMTU          uint16
-	DownloadMTUBytes     int
-	VerifyCode           [4]byte
-	Signature            [sessionInitDataSize]byte
-	MaxPackedBlocks      int
-	CreatedAt            time.Time
-	LastActivityAt       time.Time
-	ReuseUntil           time.Time
+	ID                  uint8
+	Cookie              uint8
+	ResponseMode        uint8
+	ResponseBase64      bool
+	DownloadCompression uint8
+	DownloadMTU         uint16
+	DownloadMTUBytes    int
+	MaxPackedBlocks     int
 }
 
 type closedSessionRecord struct {
@@ -225,11 +208,11 @@ func (s *sessionStore) findOrCreate(payload []byte, uploadCompressionType uint8,
 	}
 
 	record := &sessionRecord{
-		ID:            uint8(slot),
-		ResponseMode:  payload[0],
-		CreatedAt:     now,
-		ReuseUntil:    now.Add(sessionInitTTL),
-		Signature:     signature,
+		ID:             uint8(slot),
+		ResponseMode:   payload[0],
+		CreatedAt:      now,
+		ReuseUntil:     now.Add(sessionInitTTL),
+		Signature:      signature,
 		Streams:        make(map[uint16]*Stream_server),
 		ActiveStreams:  make([]uint16, 0, 8),
 		RecentlyClosed: make(map[uint16]time.Time, 8),
@@ -290,30 +273,6 @@ func (s *sessionStore) Get(sessionID uint8) (*sessionRecord, bool) {
 	return record, true
 }
 
-func (s *sessionStore) Touch(sessionID uint8, now time.Time) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	record := s.byID[sessionID]
-	if record == nil {
-		return false
-	}
-	record.setLastActivity(now)
-	return true
-}
-
-func (s *sessionStore) Active(sessionID uint8) (*sessionSnapshot, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	record := s.byID[sessionID]
-	if record == nil {
-		return nil, false
-	}
-	snapshot := record.snapshot()
-	return &snapshot, true
-}
-
 func (s *sessionStore) HasActive(sessionID uint8) bool {
 	if s == nil || sessionID == 0 {
 		return false
@@ -344,14 +303,6 @@ func (s *sessionStore) Lookup(sessionID uint8) (sessionLookupResult, bool) {
 		}, true
 	}
 	return sessionLookupResult{}, false
-}
-
-func (s *sessionStore) ExpectedCookie(sessionID uint8) (uint8, bool) {
-	info, ok := s.Lookup(sessionID)
-	if !ok {
-		return 0, false
-	}
-	return info.Cookie, true
 }
 
 func (s *sessionStore) ValidateAndTouch(sessionID uint8, cookie uint8, now time.Time) sessionValidationResult {
@@ -553,39 +504,14 @@ func (r *sessionRecord) applyMTUFromSessionInit(uploadMTU uint16, downloadMTU ui
 
 func (r *sessionRecord) runtimeView() sessionRuntimeView {
 	return sessionRuntimeView{
-		ID:                   r.ID,
-		Cookie:               r.Cookie,
-		ResponseMode:         r.ResponseMode,
-		ResponseBase64:       r.ResponseMode == mtuProbeModeBase64,
-		DownloadCompression:  r.DownloadCompression,
-		DownloadMTU:          r.DownloadMTU,
-		DownloadMTUBytes:     r.DownloadMTUBytes,
-		MaxPackedBlocks:      r.MaxPackedBlocks,
-	}
-}
-
-func (r *sessionRecord) snapshot() sessionSnapshot {
-	lastActivityUnixNano := r.lastActivity()
-	lastActivityAt := time.Time{}
-	if lastActivityUnixNano != 0 {
-		lastActivityAt = time.Unix(0, lastActivityUnixNano)
-	}
-
-	return sessionSnapshot{
-		ID:                   r.ID,
-		Cookie:               r.Cookie,
-		ResponseMode:         r.ResponseMode,
-		UploadCompression:    r.UploadCompression,
-		DownloadCompression:  r.DownloadCompression,
-		UploadMTU:            r.UploadMTU,
-		DownloadMTU:          r.DownloadMTU,
-		DownloadMTUBytes:     r.DownloadMTUBytes,
-		VerifyCode:           r.VerifyCode,
-		Signature:            r.Signature,
-		MaxPackedBlocks:      r.MaxPackedBlocks,
-		CreatedAt:            r.CreatedAt,
-		LastActivityAt:       lastActivityAt,
-		ReuseUntil:           r.ReuseUntil,
+		ID:                  r.ID,
+		Cookie:              r.Cookie,
+		ResponseMode:        r.ResponseMode,
+		ResponseBase64:      r.ResponseMode == mtuProbeModeBase64,
+		DownloadCompression: r.DownloadCompression,
+		DownloadMTU:         r.DownloadMTU,
+		DownloadMTUBytes:    r.DownloadMTUBytes,
+		MaxPackedBlocks:     r.MaxPackedBlocks,
 	}
 }
 

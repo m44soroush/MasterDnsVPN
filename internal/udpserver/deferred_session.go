@@ -119,17 +119,6 @@ func (p *deferredSessionProcessor) RemoveSession(sessionID uint8) {
 	p.mu.Unlock()
 }
 
-func (p *deferredSessionProcessor) RemoveLane(lane deferredSessionLane) {
-	if p == nil {
-		return
-	}
-	p.mu.Lock()
-	if len(p.laneWorker) != 0 {
-		delete(p.laneWorker, lane)
-	}
-	p.mu.Unlock()
-}
-
 func (p *deferredSessionProcessor) runWorker(ctx context.Context, workerIdx int) {
 	worker := &p.workers[workerIdx]
 	for {
