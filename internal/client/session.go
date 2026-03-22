@@ -228,3 +228,88 @@ func (c *Client) clearSessionResetPending() {
 		c.sessionResetPending.Store(false)
 	}
 }
+
+// applySyncedMTUState updates the client's internal MTU state after successful probing.
+func (c *Client) applySyncedMTUState(uploadMTU int, downloadMTU int, uploadChars int) {
+	if c == nil {
+		return
+	}
+	c.syncedUploadMTU = uploadMTU
+	c.syncedDownloadMTU = downloadMTU
+	c.syncedUploadChars = uploadChars
+	c.safeUploadMTU = computeSafeUploadMTU(uploadMTU, c.mtuCryptoOverhead)
+	c.maxPackedBlocks = VpnProto.CalculateMaxPackedBlocks(uploadMTU, 50, 0)
+	c.applySessionCompressionPolicy()
+	if c.log != nil && c.successMTUChecks {
+		c.log.Infof("\U0001F4CF <green>MTU state applied: UP=%d, DOWN=%d</green>", uploadMTU, downloadMTU)
+	}
+}
+
+func (c *Client) applySessionCompressionPolicy() {
+	if c == nil {
+		return
+	}
+
+	minSize := c.cfg.CompressionMinSize
+	if minSize <= 0 {
+		minSize = compression.DefaultMinSize
+	}
+
+	uploadCompression := compression.NormalizeAvailableType(c.uploadCompression)
+	downloadCompression := compression.NormalizeAvailableType(c.downloadCompression)
+
+	const mtuWarningThreshold = 100
+
+	if c.syncedUploadMTU > 0 && c.syncedUploadMTU < mtuWarningThreshold {
+		if uploadCompression != compression.TypeOff && c.log != nil {
+			c.log.Warnf(
+				"⚠️ <red>Session Compression Upload: <cyan>%s</cyan> (Disabled due to low MTU: <cyan>%d</cyan>)</red>",
+				compression.TypeName(uploadCompression),
+				c.syncedUploadMTU,
+			)
+		}
+		uploadCompression = compression.TypeOff
+		c.cfg.UploadCompressionType = int(compression.TypeOff)
+	} else if c.syncedUploadMTU > 0 && c.syncedUploadMTU <= minSize {
+		if uploadCompression != compression.TypeOff && c.log != nil {
+			c.log.Infof(
+				"\U0001F5DC <green>Session Compression Upload: <cyan>%s</cyan> (Disabled due to MinSize MTU: <cyan>%d</cyan>)</green>",
+				compression.TypeName(uploadCompression),
+				c.syncedUploadMTU,
+			)
+		}
+		uploadCompression = compression.TypeOff
+	}
+
+	if c.syncedDownloadMTU > 0 && c.syncedDownloadMTU < mtuWarningThreshold {
+		if downloadCompression != compression.TypeOff && c.log != nil {
+			c.log.Warnf(
+				"⚠️ <red>Session Compression Download: <cyan>%s</cyan> (Disabled due to low MTU: <cyan>%d</cyan>)</red>",
+				compression.TypeName(downloadCompression),
+				c.syncedDownloadMTU,
+			)
+		}
+		downloadCompression = compression.TypeOff
+		c.cfg.DownloadCompressionType = int(compression.TypeOff)
+	} else if c.syncedDownloadMTU > 0 && c.syncedDownloadMTU <= minSize {
+		if downloadCompression != compression.TypeOff && c.log != nil {
+			c.log.Infof(
+				"\U0001F5DC <green>Session Compression Download: <cyan>%s</cyan> (Disabled due to MinSize MTU: <cyan>%d</cyan>)</green>",
+				compression.TypeName(downloadCompression),
+				c.syncedDownloadMTU,
+			)
+		}
+		downloadCompression = compression.TypeOff
+	}
+
+	c.uploadCompression = uploadCompression
+	c.downloadCompression = downloadCompression
+
+	if c.log != nil {
+		c.log.Infof(
+			"\U0001F9E9 <green>Effective Compression Upload: <cyan>%s</cyan> Download: <cyan>%s</cyan></green>",
+			compression.TypeName(c.uploadCompression),
+			compression.TypeName(c.downloadCompression),
+		)
+	}
+}
