@@ -1,0 +1,49 @@
+# ==============================================================================
+# MasterDnsVPN — Docker Compose (Client)
+# Author: MasterkinG32 (Github: https://github.com/masterking32)
+# Year: 2026
+# ------------------------------------------------------------------------------
+# Builds the client image from Dockerfile.client and starts it as a service.
+#
+# QUICK START:
+#   1. Copy client_config.toml.simple → client_config.toml and edit it:
+#        - Set LISTEN_IP = "0.0.0.0"   (required for host port-mapping to work)
+#        - Set DOMAINS, ENCRYPTION_KEY, and any other settings for your server
+#   2. Start:
+#        docker compose up -d
+#   3. Use the local SOCKS5 proxy at  127.0.0.1:18000
+#   4. Follow logs:
+#        docker compose logs -f client
+#   5. Stop:
+#        docker compose down
+#
+# NOTE: No special capabilities (CAP_NET_ADMIN etc.) are needed. The client
+# tunnels TCP over DNS using only standard UDP/TCP sockets.
+# ==============================================================================
+
+services:
+  client:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    image: masterdnsvpn-client:latest
+    container_name: masterdnsvpn_client
+    restart: unless-stopped
+
+    # Expose the SOCKS5 / TCP proxy port to the host.
+    # Change the left-hand side if you need a different host port, e.g. "1080:18000".
+    ports:
+      - "18000:18000"
+
+    # Mount your configured client_config.toml read-only into the container.
+    # The file MUST exist on the host before running `docker compose up`.
+    volumes:
+      - ./client_config.toml:/app/client_config.toml:ro
+
+    # Keep stdin/tty closed — the client is a daemon, not interactive.
+    stdin_open: false
+    tty: false
+
+    # No elevated privileges are required.
+    security_opt:
+      - no-new-privileges:true
