@@ -1,0 +1,76 @@
+# ==============================================================================
+# MasterDnsVPN — Client Docker Image
+# Author: MasterkinG32 (Github: https://github.com/masterking32)
+# Year: 2026
+# ------------------------------------------------------------------------------
+# Multi-stage build: Go builder → minimal Alpine runtime.
+#
+# The MasterDnsVPN client does NOT use TUN/TAP interfaces and does NOT require
+# CAP_NET_ADMIN. It operates entirely over standard UDP/TCP sockets, so it runs
+# safely inside an unprivileged container.
+#
+# BUILD:
+#   docker build -f Dockerfile.client -t masterdnsvpn-client .
+#
+# RUN (mount your client_config.toml; set LISTEN_IP = "0.0.0.0" in the config):
+#   docker run --rm \
+#     -p 18000:18000 \
+#     -v "$(pwd)/client_config.toml:/app/client_config.toml:ro" \
+#     masterdnsvpn-client
+#
+# Optional: override the config path or enable file logging:
+#   docker run --rm \
+#     -p 18000:18000 \
+#     -v "$(pwd)/client_config.toml:/app/client_config.toml:ro" \
+#     masterdnsvpn-client -config /app/client_config.toml -log /app/client.log
+#
+# NOTE: The default LISTEN_IP in client_config.toml is "127.0.0.1", which only
+# accepts connections from within the container itself.  Change it to "0.0.0.0"
+# so that Docker's port mapping can forward traffic from the host into the proxy.
+# ==============================================================================
+
+# ── Stage 1: Build ─────────────────────────────────────────────────────────────
+FROM golang:1.25-alpine AS builder
+
+WORKDIR /build
+
+# Cache module downloads before copying source
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy the full source tree
+COPY . .
+
+# Produce a fully-static binary (no CGO) so it runs on scratch/alpine without
+# extra shared libraries.
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -trimpath -ldflags="-s -w" \
+    -o masterdnsvpn_client ./cmd/client
+
+# ── Stage 2: Runtime ──────────────────────────────────────────────────────────
+FROM alpine:3
+
+# ca-certificates is needed if the client ever resolves hostnames over HTTPS,
+# and provides a sensible root trust store for DNS/TLS.
+RUN apk add --no-cache ca-certificates tzdata
+
+WORKDIR /app
+
+# Copy only the compiled binary from the build stage
+COPY --from=builder /build/masterdnsvpn_client .
+
+# The config file is expected to be mounted at runtime:
+#   -v /host/path/client_config.toml:/app/client_config.toml:ro
+# A placeholder is included here so the container starts with a helpful error
+# message rather than a crash when no config is mounted.
+COPY client_config.toml.simple /app/client_config.toml.example
+
+# SOCKS5 / TCP proxy port (set LISTEN_PORT in your config to match)
+EXPOSE 18000
+
+# Run as a non-root user — no elevated privileges needed
+RUN addgroup -S mdvpn && adduser -S -G mdvpn mdvpn
+USER mdvpn
+
+ENTRYPOINT ["/app/masterdnsvpn_client"]
+CMD ["-config", "/app/client_config.toml"]
